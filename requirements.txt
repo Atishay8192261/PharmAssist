@@ -1,0 +1,11 @@
+Flask>=3.0.0
+python-dotenv>=1.0.0
+psycopg[binary]>=3.1.10
+psycopg_pool>=3.2.0
+psycopg2-binary>=2.9.9
+Flask-Cors>=4.0.0
+# For AI stretch goal
+langchain>=0.2.0
+openai>=1.30.0
+# Auth helpers (planned)
+bcrypt>=4.1.2
