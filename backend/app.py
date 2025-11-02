@@ -1,10 +1,20 @@
+import json
+import os
+import re
+from datetime import datetime
+
+import google.generativeai as genai
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from .db import init_pool, get_connection
+from .db import init_pool, get_connection, reset_pool
 from psycopg import IsolationLevel
+from dotenv import load_dotenv
 
 
 def create_app() -> Flask:
+    # Load env from .env for local dev
+    load_dotenv()
+
     app = Flask(__name__)
     CORS(app, resources={r"/*": {"origins": "*"}})
 
@@ -28,7 +38,6 @@ def create_app() -> Flask:
             db_ok = False
         return jsonify({"status": "ok", "db": db_ok})
 
-    # Placeholders for future endpoints
     @app.get("/api/products")
     def list_products():
         # Query params: customer_id (optional), quantity (optional, defaults to 1 for pricing tiers)
@@ -64,15 +73,12 @@ def create_app() -> Flask:
             FROM Pricing_Rules r
             WHERE (r.sku_id IS NULL OR r.sku_id = s.sku_id)
               AND COALESCE(r.min_quantity, 1) <= %s
-              AND (
-                    (%s IS NULL AND r.customer_id IS NULL)
-                 OR (%s IS NOT NULL AND (r.customer_id IS NULL OR r.customer_id = %s))
-              )
+              AND (r.customer_id IS NULL OR r.customer_id = %s)
         ) d ON TRUE
         ORDER BY p.product_id, s.sku_id
         """
 
-        params = (quantity, customer_id, customer_id, customer_id)
+        params = (quantity, customer_id)
 
         try:
             with get_connection() as conn:
@@ -140,9 +146,173 @@ def create_app() -> Flask:
                 return jsonify({"error": message}), 409
             return jsonify({"error": message}), 400
 
+    def _choose_gemini_model():
+        # Accept either plain name (gemini-2.5-flash) or full (models/gemini-2.5-flash)
+        desired = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+        if desired.startswith("models/"):
+            desired = desired.split("/", 1)[1]
+
+        candidates = [desired, "gemini-flash-latest", "gemini-2.0-flash", "gemini-pro-latest"]
+        last_err = None
+        for name in candidates:
+            try:
+                m = genai.GenerativeModel(name)
+                # Light ping to validate availability without generating content
+                try:
+                    m.count_tokens("ping")
+                except Exception:
+                    # Some models may not support countTokens yet; try a minimal dry run
+                    pass
+                return m, name
+            except Exception as e:
+                last_err = e
+                continue
+        raise RuntimeError(f"No supported Gemini model available from candidates: {candidates}. Last error: {last_err}")
+
     @app.post("/api/admin/add-inventory-nlp")
     def add_inventory_nlp():
-        return jsonify({"message": "Not implemented yet"}), 501
+        try:
+            body = request.get_json(force=True) or {}
+            text = body.get("text")
+            if not text or not isinstance(text, str):
+                return jsonify({"error": "Missing 'text' field in request body"}), 400
+
+            api_key = os.getenv("GOOGLE_API_KEY")
+            if not api_key:
+                return jsonify({"error": "GOOGLE_API_KEY not configured"}), 500
+
+            # Configure and call Gemini API (stable)
+            genai.configure(api_key=api_key)
+            model, model_name = _choose_gemini_model()
+
+            prompt = (
+                "Parse this instruction and return a JSON object with keys: sku_name, batch_no, "
+                "quantity, expiry_date. The expiry_date must be ISO YYYY-MM-DD (use the first day "
+                "of the month if only month+year are provided). Return ONLY JSON.\n"
+                f"Instruction: {text}\n"
+                "Example:\n{\n  \"sku_name\": \"Paracetamol 500mg 10-strip\",\n  \"batch_no\": \"P500-A3\",\n  \"quantity\": 100,\n  \"expiry_date\": \"2028-06-01\"\n}"
+            )
+
+            response = model.generate_content(prompt)
+            ai_text = (getattr(response, "text", None) or "").strip()
+            if not ai_text:
+                return jsonify({"error": "Empty response from Gemini"}), 502
+
+            # Extract JSON from possible markdown fences
+            m = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", ai_text, re.IGNORECASE)
+            if m:
+                ai_text = m.group(1)
+            else:
+                m2 = re.search(r"(\{[\s\S]*\})", ai_text)
+                ai_text = m2.group(1) if m2 else ai_text
+
+            try:
+                parsed = json.loads(ai_text)
+            except Exception as e:
+                return jsonify({"error": f"Gemini returned invalid JSON: {e}", "raw": ai_text}), 502
+
+            # Validate fields
+            for key in ("sku_name", "batch_no", "quantity", "expiry_date"):
+                if key not in parsed:
+                    return jsonify({"error": f"Missing field from AI output: {key}", "raw": parsed}), 502
+
+            sku_name = str(parsed["sku_name"]).strip()
+            batch_no = str(parsed["batch_no"]).strip()
+            try:
+                quantity = int(parsed["quantity"])
+            except Exception:
+                return jsonify({"error": "quantity must be an integer"}), 400
+            if quantity <= 0:
+                return jsonify({"error": "quantity must be > 0"}), 400
+
+            exp_raw = str(parsed["expiry_date"]).strip()
+            expiry_date = None
+            for fmt in ("%Y-%m-%d", "%B %Y", "%b %Y", "%Y/%m/%d", "%m/%d/%Y"):
+                try:
+                    dt = datetime.strptime(exp_raw, fmt)
+                    if fmt in ("%B %Y", "%b %Y"):
+                        dt = dt.replace(day=1)
+                    expiry_date = dt.date()
+                    break
+                except Exception:
+                    pass
+            if expiry_date is None:
+                return jsonify({"error": f"Could not parse expiry_date: {exp_raw}"}), 400
+
+            # Lookup SKU by concatenated name "ProductName package_size" with one retry on SSL/closed errors
+            def _db_work():
+                with get_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT s.sku_id, s.base_price
+                            FROM Product_SKUs s
+                            JOIN Products p ON p.product_id = s.product_id
+                            WHERE (p.name || ' ' || s.package_size) = %s
+                            LIMIT 1
+                            """,
+                            (sku_name,),
+                        )
+                        row = cur.fetchone()
+                        if not row:
+                            return None, None, None
+                        sku_id_local, base_price = int(row[0]), float(row[1])
+
+                        cost_price = round(base_price * 0.6, 2)
+                        cur.execute(
+                            """
+                            INSERT INTO Inventory_Batches(sku_id, batch_no, expiry_date, quantity_on_hand, cost_price)
+                            VALUES (%s, %s, %s, %s, %s)
+                            ON CONFLICT (sku_id, batch_no)
+                            DO UPDATE SET quantity_on_hand = Inventory_Batches.quantity_on_hand + EXCLUDED.quantity_on_hand
+                            RETURNING batch_id, quantity_on_hand
+                            """,
+                            (sku_id_local, batch_no, expiry_date, quantity, cost_price),
+                        )
+                        b_row_local = cur.fetchone()
+                        conn.commit()
+                        return sku_id_local, b_row_local[0], b_row_local[1]
+
+            try:
+                result = _db_work()
+            except Exception as e:
+                msg = str(e)
+                if (
+                    "SSL connection has been closed" in msg
+                    or "server closed the connection unexpectedly" in msg
+                    or "connection not open" in msg
+                ):
+                    # Recreate pool and retry once
+                    try:
+                        reset_pool()
+                    except Exception:
+                        pass
+                    result = _db_work()
+                else:
+                    raise
+
+            if result == (None, None, None):
+                return jsonify({"error": f"SKU not found for name: {sku_name}"}), 404
+
+            sku_id, batch_id_val, new_qoh = result
+
+            return (
+                jsonify(
+                    {
+                        "message": "Inventory batch added",
+                        "batch_id": int(batch_id_val),
+                        "sku_id": sku_id,
+                        "batch_no": batch_no,
+                        "quantity_added": quantity,
+                        "new_quantity_on_hand": int(new_qoh),
+                        "expiry_date": expiry_date.isoformat(),
+                        "source": model_name,
+                    }
+                ),
+                201,
+            )
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
 
     return app
 

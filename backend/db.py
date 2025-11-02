@@ -30,6 +30,19 @@ def init_pool():
             pass
 
 
+def reset_pool():
+    """Force recreate the pool to clear any stale/closed connections (e.g., after Neon idle closes)."""
+    global _pool
+    if not DATABASE_URL:
+        return
+    try:
+        if _pool is not None:
+            _pool.close()
+    except Exception:
+        pass
+    _pool = ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=10)
+
+
 def get_pool() -> ConnectionPool:
     global _pool
     if not DATABASE_URL:

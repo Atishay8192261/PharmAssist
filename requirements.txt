@@ -1,11 +1,25 @@
 Flask>=3.0.0
-python-dotenv>=1.0.0
-psycopg[binary]>=3.1.10
-psycopg_pool>=3.2.0
-psycopg2-binary>=2.9.9
 Flask-Cors>=4.0.0
-# For AI stretch goal
-langchain>=0.2.0
-openai>=1.30.0
+python-dotenv>=1.0.1
+requests>=2.32.3
+Faker>=25.0.0
+psycopg[binary]>=3.2.1
+psycopg_pool>=3.2.2
+psycopg2-binary>=2.9.9
+
+# LangChain + Google Gemini (stable, compatible stack)
+langchain>=0.2.16
+langchain-google-genai>=1.0.7
+google-generativeai>=0.8.3
+google-api-core>=2.19.2
+pydantic>=2.9.2
+protobuf>=4.25.3
+typing-extensions>=4.12.2
+tenacity>=8.5.0
+python-dateutil>=2.9.0.post0
+
+# Optional: OpenAI client (not used yet but kept for flexibility)
+openai>=1.51.0
+
 # Auth helpers (planned)
 bcrypt>=4.1.2
