@@ -1,7 +1,7 @@
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import google.generativeai as genai
 from flask import Flask, jsonify, request
@@ -9,6 +9,38 @@ from flask_cors import CORS
 from .db import init_pool, get_connection, reset_pool
 from psycopg import IsolationLevel
 from dotenv import load_dotenv
+import bcrypt
+import jwt
+from functools import wraps
+
+
+def _make_access_token(payload: dict) -> str:
+    secret = os.getenv("SECRET_KEY", "changeme")
+    to_encode = dict(payload)
+    to_encode.setdefault("exp", (datetime.utcnow() + timedelta(hours=1)))
+    return jwt.encode(to_encode, secret, algorithm="HS256")
+
+
+def requires_auth(role: str | None = None):
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            auth = request.headers.get("Authorization", "")
+            if not auth.startswith("Bearer "):
+                return jsonify({"error": "Missing or invalid Authorization header"}), 401
+            token = auth.split(" ", 1)[1].strip()
+            secret = os.getenv("SECRET_KEY", "changeme")
+            try:
+                claims = jwt.decode(token, secret, algorithms=["HS256"])  # type: ignore
+            except Exception as e:
+                return jsonify({"error": f"Invalid token: {e}"}), 401
+            if role and claims.get("role") != role:
+                return jsonify({"error": "Forbidden"}), 403
+            # Optionally attach claims to request context (not used currently)
+            request.user = claims  # type: ignore
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
 
 
 def create_app() -> Flask:
@@ -87,7 +119,22 @@ def create_app() -> Flask:
                     rows = cur.fetchall()
                     cols = [desc[0] for desc in cur.description]
 
-            items = [dict(zip(cols, row)) for row in rows]
+            items = []
+            for row in rows:
+                rec = dict(zip(cols, row))
+                # Ensure numeric fields are numbers for the frontend
+                if rec.get("base_price") is not None:
+                    try:
+                        rec["base_price"] = float(rec["base_price"])  # type: ignore
+                    except Exception:
+                        pass
+                if rec.get("effective_price") is not None:
+                    try:
+                        rec["effective_price"] = float(rec["effective_price"])  # type: ignore
+                    except Exception:
+                        pass
+                items.append(rec)
+
             return jsonify({
                 "customer_id": customer_id,
                 "assumed_quantity_for_pricing": quantity,
@@ -97,6 +144,7 @@ def create_app() -> Flask:
             return jsonify({"error": str(e)}), 400
 
     @app.post("/api/orders")
+    @requires_auth()  # any authenticated user
     def place_order():
         # Expected JSON: { customer_id: int, batch_id: int, quantity: int }
         try:
@@ -110,41 +158,53 @@ def create_app() -> Flask:
         if quantity <= 0:
             return jsonify({"error": "quantity must be > 0"}), 400
 
-        try:
+        def _work():
             with get_connection() as conn:
-                # Manage transaction in Python with SERIALIZABLE isolation
                 conn.isolation_level = IsolationLevel.SERIALIZABLE
                 with conn.cursor() as cur:
-                    # sp_PlaceOrder has OUT params: (o_order_id, o_order_item_id, o_sale_price)
                     cur.execute(
                         "CALL sp_PlaceOrder(%s, %s, %s, NULL, NULL, NULL)",
                         (customer_id, batch_id, quantity),
                     )
-                    row = cur.fetchone()
-                # Commit on success
+                    row_local = cur.fetchone()
                 conn.commit()
+                return row_local
 
-            if not row or len(row) < 3:
-                return jsonify({"error": "Unexpected database response"}), 500
-
-            order_id, order_item_id, sale_price = row[0], row[1], float(row[2])
-            return (
-                jsonify(
-                    {
-                        "order_id": order_id,
-                        "order_item_id": order_item_id,
-                        "sale_price": sale_price,
-                        "status": "processed",
-                    }
-                ),
-                201,
-            )
+        try:
+            row = _work()
         except Exception as e:
-            # Translate DB errors (e.g., insufficient stock) to 409 Conflict
-            message = str(e)
-            if "Insufficient stock" in message:
-                return jsonify({"error": message}), 409
-            return jsonify({"error": message}), 400
+            msg = str(e)
+            if (
+                "SSL connection has been closed" in msg
+                or "server closed the connection unexpectedly" in msg
+                or "connection not open" in msg
+            ):
+                try:
+                    reset_pool()
+                except Exception:
+                    pass
+                row = _work()
+            else:
+                message = msg
+                if "Insufficient stock" in message:
+                    return jsonify({"error": message}), 409
+                return jsonify({"error": message}), 400
+
+        if not row or len(row) < 3:
+            return jsonify({"error": "Unexpected database response"}), 500
+
+        order_id, order_item_id, sale_price = row[0], row[1], float(row[2])
+        return (
+            jsonify(
+                {
+                    "order_id": order_id,
+                    "order_item_id": order_item_id,
+                    "sale_price": sale_price,
+                    "status": "processed",
+                }
+            ),
+            201,
+        )
 
     def _choose_gemini_model():
         # Accept either plain name (gemini-2.5-flash) or full (models/gemini-2.5-flash)
@@ -169,7 +229,10 @@ def create_app() -> Flask:
                 continue
         raise RuntimeError(f"No supported Gemini model available from candidates: {candidates}. Last error: {last_err}")
 
+    # requires_auth and _make_access_token are defined at module scope
+
     @app.post("/api/admin/add-inventory-nlp")
+    @requires_auth(role="admin")
     def add_inventory_nlp():
         try:
             body = request.get_json(force=True) or {}
@@ -311,6 +374,193 @@ def create_app() -> Flask:
                 ),
                 201,
             )
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+
+    @app.post("/api/login")
+    def login():
+        try:
+            payload = request.get_json(force=True) or {}
+            username = payload.get("username")
+            password = payload.get("password")
+            if not username or not password:
+                return jsonify({"error": "Missing username or password"}), 400
+            def _work():
+                with get_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT user_id, username, password_hash, role, customer_id
+                            FROM Users
+                            WHERE username = %s
+                            LIMIT 1
+                            """,
+                            (username,),
+                        )
+                        return cur.fetchone()
+
+            try:
+                row = _work()
+            except Exception as e:
+                msg = str(e)
+                if (
+                    "SSL connection has been closed" in msg
+                    or "server closed the connection unexpectedly" in msg
+                    or "connection not open" in msg
+                ):
+                    try:
+                        reset_pool()
+                    except Exception:
+                        pass
+                    row = _work()
+                else:
+                    return jsonify({"error": msg}), 400
+
+            if not row:
+                return jsonify({"error": "Invalid credentials"}), 401
+
+            user_id, _uname, stored_hash, role, customer_id = row
+            try:
+                ok = bcrypt.checkpw(
+                    password.encode("utf-8"),
+                    (stored_hash if isinstance(stored_hash, bytes) else stored_hash.encode("utf-8")),
+                )
+            except Exception:
+                # In case stored_hash is malformed
+                ok = False
+
+            if not ok:
+                return jsonify({"error": "Invalid credentials"}), 401
+
+            token = _make_access_token({
+                "sub": str(user_id),
+                "username": _uname,
+                "role": role,
+                "customer_id": int(customer_id) if customer_id is not None else None,
+            })
+            return jsonify({
+                "access_token": token,
+                "token_type": "Bearer",
+            }), 200
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+
+    @app.get("/api/my-orders")
+    @requires_auth()  # any authenticated user
+    def my_orders():
+        try:
+            claims = getattr(request, "user", {}) or {}
+            customer_id = claims.get("customer_id")
+            if customer_id is None:
+                return jsonify({"error": "No customer_id associated with this user"}), 400
+            sql = """
+                SELECT o.order_id,
+                       o.order_date,
+                       o.status,
+                       COALESCE(SUM(oi.quantity_ordered),0) AS total_quantity,
+                       COALESCE(SUM(oi.sale_price),0)       AS total_price
+                FROM Orders o
+                LEFT JOIN Order_Items oi ON oi.order_id = o.order_id
+                WHERE o.customer_id = %s
+                GROUP BY o.order_id
+                ORDER BY o.order_date DESC
+            """
+            def _work():
+                with get_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(sql, (customer_id,))
+                        rows_local = cur.fetchall()
+                        cols_local = [d[0] for d in cur.description]
+                        return rows_local, cols_local
+            try:
+                rows, cols = _work()
+            except Exception as e:
+                msg = str(e)
+                if (
+                    "SSL connection has been closed" in msg
+                    or "server closed the connection unexpectedly" in msg
+                    or "connection not open" in msg
+                ):
+                    try:
+                        reset_pool()
+                    except Exception:
+                        pass
+                    rows, cols = _work()
+                else:
+                    return jsonify({"error": msg}), 400
+            data = []
+            for r in rows:
+                rec = dict(zip(cols, r))
+                # Cast totals to numbers as the UI expects
+                if rec.get("total_quantity") is not None:
+                    try:
+                        rec["total_quantity"] = int(rec["total_quantity"])  # type: ignore
+                    except Exception:
+                        pass
+                if rec.get("total_price") is not None:
+                    try:
+                        rec["total_price"] = float(rec["total_price"])  # type: ignore
+                    except Exception:
+                        pass
+                data.append(rec)
+            return jsonify({"customer_id": customer_id, "orders": data})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+
+    @app.get("/api/admin/all-orders")
+    @requires_auth(role="admin")
+    def all_orders():
+        try:
+            sql = """
+                SELECT o.order_id,
+                       o.order_date,
+                       o.status,
+                       o.customer_id,
+                       COALESCE(SUM(oi.quantity_ordered),0) AS total_quantity,
+                       COALESCE(SUM(oi.sale_price),0)       AS total_price
+                FROM Orders o
+                LEFT JOIN Order_Items oi ON oi.order_id = o.order_id
+                GROUP BY o.order_id
+                ORDER BY o.order_date DESC
+            """
+            def _work():
+                with get_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(sql)
+                        rows_local = cur.fetchall()
+                        cols_local = [d[0] for d in cur.description]
+                        return rows_local, cols_local
+            try:
+                rows, cols = _work()
+            except Exception as e:
+                msg = str(e)
+                if (
+                    "SSL connection has been closed" in msg
+                    or "server closed the connection unexpectedly" in msg
+                    or "connection not open" in msg
+                ):
+                    try:
+                        reset_pool()
+                    except Exception:
+                        pass
+                    rows, cols = _work()
+                else:
+                    return jsonify({"error": msg}), 400
+            data = []
+            for r in rows:
+                rec = dict(zip(cols, r))
+                if rec.get("total_quantity") is not None:
+                    try:
+                        rec["total_quantity"] = int(rec["total_quantity"])  # type: ignore
+                    except Exception:
+                        pass
+                if rec.get("total_price") is not None:
+                    try:
+                        rec["total_price"] = float(rec["total_price"])  # type: ignore
+                    except Exception:
+                        pass
+                data.append(rec)
+            return jsonify({"orders": data})
         except Exception as e:
             return jsonify({"error": str(e)}), 400
 

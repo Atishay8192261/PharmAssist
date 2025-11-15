@@ -23,3 +23,6 @@ openai>=1.51.0
 
 # Auth helpers (planned)
 bcrypt>=4.1.2
+
+# JWT for auth
+PyJWT>=2.9.0

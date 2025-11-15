@@ -63,6 +63,19 @@ def find_or_prepare_batch(conn) -> TargetBatch:
 def place_order(batch: TargetBatch, results: list, index: int, start_barrier: threading.Barrier):
     start_barrier.wait()
     try:
+        # Obtain a token once per thread to avoid cross-thread header issues
+        login = requests.post(
+            f"{API_BASE}/api/login",
+            json={"username": "pharma1", "password": "test1234"},
+            timeout=10,
+        )
+        token = None
+        try:
+            token = login.json().get("access_token")
+        except Exception:
+            pass
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+
         resp = requests.post(
             f"{API_BASE}/api/orders",
             json={
@@ -70,6 +83,7 @@ def place_order(batch: TargetBatch, results: list, index: int, start_barrier: th
                 "batch_id": batch.batch_id,
                 "quantity": ORDER_QTY,
             },
+            headers=headers,
             timeout=REQUEST_TIMEOUT,
         )
         try:
