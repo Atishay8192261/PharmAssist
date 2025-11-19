@@ -36,6 +36,10 @@ export interface ProductsResponse {
   customer_id?: number;
   assumed_quantity_for_pricing: number;
   items: Product[];
+  total_items: number;
+  total_pages: number;
+  current_page: number;
+  page_size: number;
 }
 
 export interface PlaceOrderRequest {
@@ -116,13 +120,19 @@ class ApiClient {
     return res.json();
   }
 
-  async getProducts(params?: { customerId?: number; quantity?: number }): Promise<ProductsResponse> {
+  async getProducts(params?: { customerId?: number; quantity?: number; page?: number; limit?: number }): Promise<ProductsResponse> {
     const url = new URL(`${API_BASE_URL}/api/products`);
     if (params?.customerId) {
       url.searchParams.set('customer_id', params.customerId.toString());
     }
     if (params?.quantity) {
       url.searchParams.set('quantity', params.quantity.toString());
+    }
+    if (params?.page) {
+      url.searchParams.set('page', params.page.toString());
+    }
+    if (params?.limit) {
+      url.searchParams.set('limit', params.limit.toString());
     }
 
     const res = await fetch(url.toString());

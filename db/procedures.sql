@@ -81,9 +81,9 @@ BEGIN
 
 	v_price := ROUND(v_base_price * (1 - v_discount/100.0), 2);
 
-	-- Create the order in processed state (single-item order for now)
+	-- Create the order in pending state (single-item order for now)
 	INSERT INTO Orders(customer_id, status)
-	VALUES (p_customer_id, 'processed')
+	VALUES (p_customer_id, 'pending')
 	RETURNING order_id INTO o_order_id;
 
 	-- Decrement inventory for the locked batch

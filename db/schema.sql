@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS Orders (
     order_id SERIAL PRIMARY KEY,
     customer_id INT NOT NULL REFERENCES Customers(customer_id),
     order_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    status VARCHAR(50) NOT NULL CHECK (status IN ('pending', 'processed', 'shipped', 'cancelled'))
+    status VARCHAR(50) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processed', 'shipped', 'cancelled'))
 );
 
 -- 7. Order Items (Links an Order to a specific BATCH)
@@ -75,6 +75,26 @@ CREATE TABLE IF NOT EXISTS Pricing_Rules (
     -- Rule priority can be added later if needed
     UNIQUE(sku_id, customer_id, min_quantity)
 );
+
+-- 10. Shopping Cart (one active cart per user for simplicity)
+CREATE TABLE IF NOT EXISTS Carts (
+    cart_id SERIAL PRIMARY KEY,
+    user_id INT NOT NULL REFERENCES Users(user_id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id)
+);
+
+-- 11. Cart Items
+CREATE TABLE IF NOT EXISTS Cart_Items (
+    cart_item_id SERIAL PRIMARY KEY,
+    cart_id INT NOT NULL REFERENCES Carts(cart_id) ON DELETE CASCADE,
+    sku_id INT NOT NULL REFERENCES Product_SKUs(sku_id) ON DELETE CASCADE,
+    quantity INT NOT NULL CHECK (quantity > 0),
+    UNIQUE(cart_id, sku_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cart_items_cart_id ON Cart_Items(cart_id);
+CREATE INDEX IF NOT EXISTS idx_cart_items_sku_id ON Cart_Items(sku_id);
 
 -- 9. Create Indexes for Optimization
 CREATE INDEX IF NOT EXISTS idx_batches_sku_id ON Inventory_Batches(sku_id);
