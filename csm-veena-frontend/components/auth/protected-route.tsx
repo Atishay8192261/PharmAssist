@@ -1,8 +1,8 @@
-'use client';
+"use client";
 
-import { useEffect, useState } from 'react';
-import { useRouter } from 'next/navigation';
-import { isAuthenticated, isAdmin } from '@/lib/auth';
+import { useEffect } from "react";
+import { useRouter } from "next/navigation";
+import { useAuth } from "@/context/auth-context";
 
 interface ProtectedRouteProps {
   children: React.ReactNode;
@@ -11,33 +11,21 @@ interface ProtectedRouteProps {
 
 export function ProtectedRoute({ children, requireAdmin = false }: ProtectedRouteProps) {
   const router = useRouter();
-  const [allowed, setAllowed] = useState(false);
-  const [checked, setChecked] = useState(false);
+  const { isAuthenticated, isAdmin, isLoading } = useAuth();
 
   useEffect(() => {
-    // Defer auth checks to client after mount to avoid SSR localStorage access
-    const authed = isAuthenticated();
-    if (!authed) {
-      router.replace('/login');
-      setChecked(true);
+    if (isLoading) return;
+    if (!isAuthenticated) {
+      router.push("/login");
       return;
     }
-    if (requireAdmin && !isAdmin()) {
-      router.replace('/catalog');
-      setChecked(true);
-      return;
+    if (requireAdmin && !isAdmin) {
+      router.push("/catalog");
     }
-    setAllowed(true);
-    setChecked(true);
-  }, [router, requireAdmin]);
+  }, [isAuthenticated, isAdmin, isLoading, requireAdmin, router]);
 
-  if (!checked) {
-    return null; // Optionally render a spinner
-  }
-
-  if (!allowed) {
-    return null;
-  }
-
+  if (isLoading) return null;
+  if (!isAuthenticated) return null;
+  if (requireAdmin && !isAdmin) return null;
   return <>{children}</>;
 }

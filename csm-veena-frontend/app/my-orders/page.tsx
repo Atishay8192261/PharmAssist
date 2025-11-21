@@ -1,15 +1,5 @@
-'use client';
-
-import { ProtectedRoute } from '@/components/auth/protected-route';
-import { MyOrders } from '@/components/customer/my-orders';
-import { CustomerLayout } from '@/components/layouts/customer-layout';
+import { redirect } from 'next/navigation';
 
 export default function MyOrdersPage() {
-  return (
-    <ProtectedRoute>
-      <CustomerLayout>
-        <MyOrders />
-      </CustomerLayout>
-    </ProtectedRoute>
-  );
+  redirect('/customer/my-orders');
 }

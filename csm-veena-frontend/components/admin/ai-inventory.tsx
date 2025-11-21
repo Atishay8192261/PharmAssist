@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { apiClient, AddInventoryNLPResponse } from '@/lib/api';
+import { api as apiClient } from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
@@ -16,10 +16,21 @@ const EXAMPLE_PROMPTS = [
   'Add 15 units of Ibuprofen 400mg 20-strip Batch #IBU400-A1 expiring March 2028',
 ];
 
-export function AIInventory() {
+interface AiResult {
+  message: string
+  batch_id: number
+  sku_id: number
+  batch_no: string
+  quantity_added: number
+  new_quantity_on_hand: number
+  expiry_date: string
+  source: string
+}
+
+export function AIInventory({ onAdded }: { onAdded?: (summary: AiResult) => void }) {
   const [text, setText] = useState('');
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<AddInventoryNLPResponse | null>(null);
+  const [result, setResult] = useState<AiResult | null>(null);
   const [error, setError] = useState('');
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -29,8 +40,9 @@ export function AIInventory() {
     setResult(null);
 
     try {
-      const response = await apiClient.addInventoryNLP({ text });
+      const response = await apiClient.addInventoryNLP(text);
       setResult(response);
+      onAdded?.(response as AiResult);
       setText('');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to add inventory');
@@ -39,7 +51,7 @@ export function AIInventory() {
     }
   };
 
-  const useExample = (example: string) => {
+  const applyExample = (example: string) => {
     setText(example);
   };
 
@@ -97,7 +109,7 @@ export function AIInventory() {
               {EXAMPLE_PROMPTS.map((prompt, index) => (
                 <button
                   key={index}
-                  onClick={() => useExample(prompt)}
+                  onClick={() => applyExample(prompt)}
                   className="w-full text-left p-3 text-sm rounded-lg border bg-muted/50 hover:bg-muted transition-colors"
                   type="button"
                 >

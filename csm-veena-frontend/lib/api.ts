@@ -1,209 +1,238 @@
-const API_BASE_URL = 'http://localhost:5000';
+import type {
+  LoginResponse,
+  ProductsResponse,
+  CartResponse,
+  CartItemUpsertResponse,
+  CartItemRemoveResponse,
+  CheckoutResponse,
+  MyOrdersResponse,
+  AdminOrdersResponse,
+  AdminInventoryResponse,
+  OrderStatus,
+  ErrorResponse,
+  AdminOrderDetailsResponse,
+} from "./types"
+import { toNumber } from "./utils"
 
-export interface LoginRequest {
-  username: string;
-  password: string;
-}
-
-export interface LoginResponse {
-  access_token: string;
-  token_type: string;
-}
-
-export interface JWTPayload {
-  sub: string;
-  username: string;
-  role: 'admin' | 'customer';
-  customer_id: number | null;
-  exp: number;
-}
-
-export interface Product {
-  product_id: number;
-  product_name: string;
-  manufacturer: string;
-  description: string;
-  sku_id: number;
-  package_size: string;
-  unit_type: string;
-  base_price: number;
-  total_on_hand: number;
-  earliest_expiry: string;
-  effective_price: number;
-}
-
-export interface ProductsResponse {
-  customer_id?: number;
-  assumed_quantity_for_pricing: number;
-  items: Product[];
-  total_items: number;
-  total_pages: number;
-  current_page: number;
-  page_size: number;
-}
-
-export interface PlaceOrderRequest {
-  customer_id: number;
-  batch_id: number;
-  quantity: number;
-}
-
-export interface PlaceOrderResponse {
-  order_id: number;
-  order_item_id: number;
-  sale_price: number;
-  status: string;
-}
-
-export interface Order {
-  order_id: number;
-  order_date: string;
-  status: string;
-  total_quantity: number;
-  total_price: number;
-  customer_id?: number;
-}
-
-export interface MyOrdersResponse {
-  customer_id: number;
-  orders: Order[];
-}
-
-export interface AllOrdersResponse {
-  orders: Order[];
-}
-
-export interface AddInventoryNLPRequest {
-  text: string;
-}
-
-export interface AddInventoryNLPResponse {
-  message: string;
-  batch_id: number;
-  sku_id: number;
-  batch_no: string;
-  quantity_added: number;
-  new_quantity_on_hand: number;
-  expiry_date: string;
-  source: string;
-}
-
-export interface ErrorResponse {
-  error: string;
-  raw?: string;
-}
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000"
 
 class ApiClient {
   private getAuthHeaders(): HeadersInit {
-    const token = localStorage.getItem('access_token');
+    const token = typeof window !== "undefined" ? localStorage.getItem("access_token") : null
     const headers: HeadersInit = {
-      'Content-Type': 'application/json',
-    };
+      "Content-Type": "application/json",
+    }
     if (token) {
-      headers['Authorization'] = `Bearer ${token}`;
+      headers["Authorization"] = `Bearer ${token}`
     }
-    return headers;
+    return headers
   }
 
-  async login(credentials: LoginRequest): Promise<LoginResponse> {
-    const res = await fetch(`${API_BASE_URL}/api/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+  private async fetch<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+    const url = `${API_BASE_URL}${endpoint}`
+    const headers = { ...this.getAuthHeaders(), ...options.headers }
+    let response: Response
+    try {
+      response = await fetch(url, { ...options, headers })
+    } catch (networkErr: any) {
+      // Preserve AbortError so UI logic can suppress toast for canceled requests
+      if (networkErr?.name === 'AbortError') {
+        throw networkErr
+      }
+      throw {
+        status: 0,
+        message: networkErr?.message || 'Network request failed',
+        code: 'NETWORK_ERROR',
+        name: 'NetworkError'
+      }
+    }
+
+    if (!response.ok) {
+      // Handle 401 Unauthorized globally
+      if (response.status === 401) {
+        // Only force logout redirect if we actually had a token; avoid redirect loops on anonymous pages
+        const hadToken = typeof window !== 'undefined' && !!localStorage.getItem('access_token')
+        if (hadToken && typeof window !== "undefined") {
+          localStorage.removeItem("access_token")
+          window.location.href = "/login"
+        }
+      }
+
+      let errorMessage = "An unexpected error occurred"
+      let errorBody: ErrorResponse | null = null
+
+      try {
+        errorBody = await response.json()
+        errorMessage = errorBody?.error || response.statusText
+      } catch (e) {
+        errorMessage = response.statusText
+      }
+
+      // Throw an object that matches our ApiError interface structure
+      throw {
+        status: response.status,
+        message: errorMessage,
+        code: errorBody?.code,
+        name: 'HttpError'
+      }
+    }
+
+    // For 204 No Content
+    if (response.status === 204) {
+      return {} as T
+    }
+
+    const data = await response.json()
+    return this.normalizeNumbers(data) as T
+  }
+
+  // Recursively convert string numbers to actual numbers
+  private normalizeNumbers(data: any): any {
+    if (Array.isArray(data)) {
+      return data.map((item) => this.normalizeNumbers(item))
+    } else if (typeof data === "object" && data !== null) {
+      const newData: any = {}
+      for (const key in data) {
+        if (
+          [
+            "base_price",
+            "effective_price",
+            "total_price",
+            "cost_price",
+            "estimated_total_price",
+            "total_on_hand",
+            "quantity_on_hand",
+          ].includes(key)
+        ) {
+          newData[key] = toNumber(data[key])
+        } else {
+          newData[key] = this.normalizeNumbers(data[key])
+        }
+      }
+      return newData
+    }
+    return data
+  }
+
+  // Auth
+  async login(credentials: { username: string; password: string }): Promise<LoginResponse> {
+    return this.fetch<LoginResponse>("/api/login", {
+      method: "POST",
       body: JSON.stringify(credentials),
-    });
-    
-    if (!res.ok) {
-      const error: ErrorResponse = await res.json();
-      throw new Error(error.error || 'Login failed');
-    }
-    
-    return res.json();
+    })
   }
 
-  async getProducts(params?: { customerId?: number; quantity?: number; page?: number; limit?: number }): Promise<ProductsResponse> {
-    const url = new URL(`${API_BASE_URL}/api/products`);
-    if (params?.customerId) {
-      url.searchParams.set('customer_id', params.customerId.toString());
-    }
-    if (params?.quantity) {
-      url.searchParams.set('quantity', params.quantity.toString());
-    }
-    if (params?.page) {
-      url.searchParams.set('page', params.page.toString());
-    }
-    if (params?.limit) {
-      url.searchParams.set('limit', params.limit.toString());
-    }
+  // Products
+  async getProducts(
+    params: {
+      page?: number
+      limit?: number
+      quantity?: number
+      customer_id?: number
+      search?: string
+    } = {},
+    signal?: AbortSignal,
+  ): Promise<ProductsResponse> {
+    const query = new URLSearchParams()
+    if (params.page) query.set("page", params.page.toString())
+    if (params.limit) query.set("limit", params.limit.toString())
+    if (params.quantity) query.set("quantity", params.quantity.toString())
+    if (params.customer_id) query.set("customer_id", params.customer_id.toString())
+    if (params.search) query.set("search", params.search)
 
-    const res = await fetch(url.toString());
-    if (!res.ok) {
-      const error: ErrorResponse = await res.json();
-      throw new Error(error.error || 'Failed to load products');
-    }
-    
-    return res.json();
+    return this.fetch<ProductsResponse>(`/api/products?${query.toString()}`, { signal })
   }
 
-  async placeOrder(order: PlaceOrderRequest): Promise<PlaceOrderResponse> {
-    const res = await fetch(`${API_BASE_URL}/api/orders`, {
-      method: 'POST',
-      headers: this.getAuthHeaders(),
-      body: JSON.stringify(order),
-    });
-
-    if (res.status === 409) {
-      const error: ErrorResponse = await res.json();
-      throw new Error(error.error || 'Insufficient stock');
-    }
-
-    if (!res.ok) {
-      const error: ErrorResponse = await res.json();
-      throw new Error(error.error || 'Order failed');
-    }
-
-    return res.json();
+  // Cart
+  async getCart(): Promise<CartResponse> {
+    return this.fetch<CartResponse>("/api/cart")
   }
 
+  async updateCartItem(sku_id: number, quantity: number): Promise<CartItemUpsertResponse | CartItemRemoveResponse> {
+    return this.fetch<CartItemUpsertResponse | CartItemRemoveResponse>("/api/cart", {
+      method: "POST",
+      body: JSON.stringify({ sku_id, quantity }),
+    })
+  }
+
+  async checkout(): Promise<CheckoutResponse> {
+    return this.fetch<CheckoutResponse>("/api/checkout", {
+      method: "POST",
+    })
+  }
+
+  // Orders
   async getMyOrders(): Promise<MyOrdersResponse> {
-    const res = await fetch(`${API_BASE_URL}/api/my-orders`, {
-      headers: this.getAuthHeaders(),
-    });
-
-    if (!res.ok) {
-      const error: ErrorResponse = await res.json();
-      throw new Error(error.error || 'Failed to load orders');
-    }
-
-    return res.json();
+    return this.fetch<MyOrdersResponse>("/api/my-orders")
   }
 
-  async getAllOrders(): Promise<AllOrdersResponse> {
-    const res = await fetch(`${API_BASE_URL}/api/admin/all-orders`, {
-      headers: this.getAuthHeaders(),
-    });
-
-    if (!res.ok) {
-      const error: ErrorResponse = await res.json();
-      throw new Error(error.error || 'Failed to load all orders');
-    }
-
-    return res.json();
+  async getAllOrders(): Promise<AdminOrdersResponse> {
+    return this.fetch<AdminOrdersResponse>("/api/admin/all-orders")
   }
 
-  async addInventoryNLP(request: AddInventoryNLPRequest): Promise<AddInventoryNLPResponse> {
-    const res = await fetch(`${API_BASE_URL}/api/admin/add-inventory-nlp`, {
-      method: 'POST',
-      headers: this.getAuthHeaders(),
-      body: JSON.stringify(request),
-    });
+  async updateOrderStatus(order_id: number, status: OrderStatus): Promise<{ order_id: number; status: OrderStatus }> {
+    return this.fetch<{ order_id: number; status: OrderStatus }>(`/api/admin/orders/${order_id}/status`, {
+      method: "POST",
+      body: JSON.stringify({ status }),
+    })
+  }
 
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.error || 'AI inventory failed');
-    }
+  async getAdminOrderDetails(order_id: number): Promise<AdminOrderDetailsResponse> {
+    return this.fetch<AdminOrderDetailsResponse>(`/api/admin/orders/${order_id}/items`)
+  }
 
-    return data;
+  // Inventory
+  async getAdminInventory(): Promise<AdminInventoryResponse> {
+    return this.fetch<AdminInventoryResponse>("/api/admin/inventory")
+  }
+
+  async getAdminDashboardStats(): Promise<import("./types").AdminDashboardStats> {
+    return this.fetch<import("./types").AdminDashboardStats>("/api/admin/dashboard-stats")
+  }
+
+  // Legacy / NLP
+  async addInventoryNLP(text: string): Promise<any> {
+    return this.fetch("/api/admin/add-inventory-nlp", {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    })
+  }
+
+  // Inventory CRUD
+  async createInventoryBatch(payload: { sku_id?: number; sku_name?: string; batch_no: string; quantity: number; expiry_date: string }): Promise<any> {
+    return this.fetch("/api/admin/inventory/batches", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    })
+  }
+
+  async updateInventoryBatch(batch_id: number, payload: { quantity_on_hand?: number; expiry_date?: string; cost_price?: number }): Promise<any> {
+    return this.fetch(`/api/admin/inventory/batches/${batch_id}`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    })
+  }
+
+  async deleteInventoryBatch(batch_id: number): Promise<{ deleted: boolean; batch_id: number }> {
+    return this.fetch<{ deleted: boolean; batch_id: number }>(`/api/admin/inventory/batches/${batch_id}`, {
+      method: "DELETE",
+    })
+  }
+
+  // Product & SKU creation
+  async createProduct(payload: { name: string; manufacturer?: string; description?: string }): Promise<any> {
+    return this.fetch("/api/admin/products", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    })
+  }
+
+  async createSku(payload: { product_id: number; package_size: string; unit_type: string; base_price: number }): Promise<any> {
+    return this.fetch("/api/admin/skus", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    })
   }
 }
 
-export const apiClient = new ApiClient();
+export const api = new ApiClient()

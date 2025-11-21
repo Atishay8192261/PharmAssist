@@ -8,7 +8,6 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Loader2 } from 'lucide-react';
-import { Button } from '@/components/ui/button';
 
 export function ProductCatalog() {
   const [products, setProducts] = useState<Product[]>([]);
@@ -16,15 +15,13 @@ export function ProductCatalog() {
   const [error, setError] = useState('');
   const [quantity, setQuantity] = useState(1);
   const [orderSuccess, setOrderSuccess] = useState('');
-  const [currentPage, setCurrentPage] = useState(1);
-  const [totalPages, setTotalPages] = useState(1);
 
   const user = getCurrentUser();
   const customerId = user?.customer_id;
 
   useEffect(() => {
     loadProducts();
-  }, [quantity, customerId, currentPage]);
+  }, [quantity, customerId]);
 
   const loadProducts = async () => {
     try {
@@ -33,12 +30,8 @@ export function ProductCatalog() {
       const response = await apiClient.getProducts({
         customerId: customerId || undefined,
         quantity,
-        page: currentPage,
-        limit: 20,
       });
       setProducts(response.items);
-      if (typeof response.total_pages === 'number') setTotalPages(response.total_pages);
-      if (typeof response.current_page === 'number') setCurrentPage(response.current_page);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load products');
     } finally {
@@ -53,7 +46,7 @@ export function ProductCatalog() {
   };
 
   return (
-    <div className="max-w-7xl mx-auto px-4 space-y-6">
+    <div className="space-y-6">
       <div>
         <h1 className="text-3xl font-bold">Product Catalog</h1>
         <p className="text-muted-foreground mt-2">
@@ -81,11 +74,7 @@ export function ProductCatalog() {
             type="number"
             min="1"
             value={quantity}
-            onChange={(e) => {
-              const q = Math.max(1, parseInt(e.target.value) || 1);
-              setQuantity(q);
-              setCurrentPage(1); // reset to first page when pricing quantity changes
-            }}
+            onChange={(e) => setQuantity(Math.max(1, parseInt(e.target.value) || 1))}
             className="mt-2"
           />
         </div>
@@ -110,27 +99,6 @@ export function ProductCatalog() {
           ))}
         </div>
       )}
-
-      {/* Pagination Controls */}
-      <div className="flex items-center justify-between py-4">
-        <Button
-          variant="outline"
-          onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
-          disabled={currentPage <= 1 || loading}
-        >
-          Previous Page
-        </Button>
-        <div className="text-sm text-muted-foreground">
-          Page {currentPage} of {totalPages}
-        </div>
-        <Button
-          variant="outline"
-          onClick={() => setCurrentPage((p) => (p < totalPages ? p + 1 : p))}
-          disabled={currentPage >= totalPages || loading}
-        >
-          Next Page
-        </Button>
-      </div>
     </div>
   );
 }

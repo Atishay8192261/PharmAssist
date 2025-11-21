@@ -60,7 +60,6 @@ def create_app() -> Flask:
 
     @app.get("/health")
     def health():
-        # simple DB check if possible
         try:
             with get_connection() as conn:
                 with conn.cursor() as cur:
@@ -73,8 +72,6 @@ def create_app() -> Flask:
 
     @app.get("/api/products")
     def list_products():
-        # Query params: customer_id (optional), quantity (optional, defaults to 1 for pricing tiers)
-        # Pagination params: page (default 1), limit (default 20)
         customer_id = request.args.get("customer_id", default=None, type=int)
         quantity = request.args.get("quantity", default=1, type=int)
         if not quantity or quantity <= 0:
@@ -86,12 +83,70 @@ def create_app() -> Flask:
             page = 1
         if limit is None or limit <= 0:
             limit = 20
-        # Safety clamp to avoid accidental huge responses
         if limit > 200:
             limit = 200
         offset = (page - 1) * limit
 
-        sql_items = """
+        search = request.args.get("search", default=None, type=str)
+
+        def _build_search_tokens(raw: str) -> tuple[str, list]:
+            tokens = [t.strip() for t in re.split(r"\s+", raw) if t.strip()]
+            groups: list[str] = []
+            params: list = []
+            base_fields = [
+                "p.name",
+                "p.manufacturer",
+                "COALESCE(p.description,'')",
+                "s.package_size",
+                "s.unit_type::text",
+                "(p.name || ' ' || s.package_size)",
+            ]
+            for tok in tokens:
+                if len(tok) < 2:
+                    continue
+                pattern = f"%{tok}%"
+                ors_exprs = [f"{f} ILIKE %s" for f in base_fields]
+                params.extend([pattern] * len(base_fields))
+                if tok.isdigit():
+                    ors_exprs.append("CAST(s.sku_id AS TEXT) = %s")
+                    params.append(tok)
+                    ors_exprs.append("CAST(s.sku_id AS TEXT) ILIKE %s")
+                    params.append(pattern)
+                groups.append("(" + " OR ".join(ors_exprs) + ")")
+            if not groups:
+                return "", []
+            clause = " AND ".join(groups)
+            # Sanity: count placeholders vs params length
+            placeholder_count = clause.count("%s")
+            if placeholder_count != len(params):
+                # Return special clause that will yield empty results and signal mismatch
+                return "(1=0)", []
+            return clause, params
+
+        search_clause_sql = ""
+        search_params: list = []
+        if search:
+            clause_sql, params = _build_search_tokens(search)
+            search_clause_sql = clause_sql
+            search_params = params
+
+        # If user provided search but no valid tokens after filtering, return empty set directly
+        if search and not search_clause_sql:
+            return jsonify({
+                "customer_id": customer_id,
+                "assumed_quantity_for_pricing": quantity,
+                "items": [],
+                "total_items": 0,
+                "total_pages": 0,
+                "current_page": page,
+                "page_size": limit,
+                "search": search,
+                "note": "no valid tokens or placeholder mismatch",
+            })
+
+        where_sql = f"WHERE {search_clause_sql}" if search_clause_sql else ""
+
+        sql_items = f"""
         SELECT
             p.product_id,
             p.name AS product_name,
@@ -122,25 +177,36 @@ def create_app() -> Flask:
             FROM Inventory_Batches b
             GROUP BY b.sku_id
         ) st ON st.sku_id = s.sku_id
+        {where_sql}
         ORDER BY p.product_id, s.sku_id
         LIMIT %s OFFSET %s
         """
 
-        sql_count = """
+        sql_count = f"""
         SELECT COUNT(*)
         FROM Product_SKUs s
         JOIN Products p ON p.product_id = s.product_id
+        {where_sql}
         """
 
-        params_items = (quantity, customer_id, limit, offset)
+        # Parameter order MUST follow appearance in sql_items:
+        # 1-2: discount subquery (%s for quantity, %s for customer_id)
+        # 3..N: search clause placeholders (if any)
+        # Last 2: LIMIT %s OFFSET %s
+        params_items = [quantity, customer_id] + list(search_params) + [limit, offset]
+        params_count = tuple(search_params)
 
         def _work():
             with get_connection() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(sql_count)
+                    cur.execute(sql_count, params_count)
                     total_items_row = cur.fetchone()
                     total_items_local = int(total_items_row[0]) if total_items_row else 0
-                    cur.execute(sql_items, params_items)
+                    # Basic sanity: count placeholders in items query
+                    expected_placeholders = sql_items.count('%s')
+                    if expected_placeholders != len(params_items):
+                        raise ValueError(f"search_param_mismatch: expected {expected_placeholders} params, got {len(params_items)}")
+                    cur.execute(sql_items, tuple(params_items))
                     rows_local = cur.fetchall()
                     cols_local = [desc[0] for desc in cur.description]
                     return total_items_local, rows_local, cols_local
@@ -162,10 +228,9 @@ def create_app() -> Flask:
             else:
                 return jsonify({"error": msg}), 400
 
-        items = []
+        items: list[dict] = []
         for row in rows:
             rec = dict(zip(cols, row))
-            # Ensure numeric fields are numbers for the frontend
             if rec.get("base_price") is not None:
                 try:
                     rec["base_price"] = float(rec["base_price"])  # type: ignore
@@ -184,7 +249,6 @@ def create_app() -> Flask:
             items.append(rec)
 
         total_pages = (total_items + limit - 1) // limit if limit > 0 else 0
-
         return jsonify({
             "customer_id": customer_id,
             "assumed_quantity_for_pricing": quantity,
@@ -193,6 +257,7 @@ def create_app() -> Flask:
             "total_pages": total_pages,
             "current_page": page,
             "page_size": limit,
+            "search": search,
         })
         
 
@@ -355,10 +420,11 @@ def create_app() -> Flask:
             if expiry_date is None:
                 return jsonify({"error": f"Could not parse expiry_date: {exp_raw}"}), 400
 
-            # Lookup SKU by concatenated name "ProductName package_size" with one retry on SSL/closed errors
+            # Lookup SKU by concatenated name with flexible fallback (exact then fuzzy)
             def _db_work():
                 with get_connection() as conn:
                     with conn.cursor() as cur:
+                        # First: exact match (legacy)
                         cur.execute(
                             """
                             SELECT s.sku_id, s.base_price
@@ -371,7 +437,28 @@ def create_app() -> Flask:
                         )
                         row = cur.fetchone()
                         if not row:
-                            return None, None, None
+                            # Try fuzzy: collapse whitespace/punctuation and ILIKE partials
+                            cleaned = re.sub(r"[\s\-_/]+", " ", sku_name).strip()
+                            tokens = [t for t in cleaned.split() if t]
+                            if not tokens:
+                                return None, None, None, "empty_tokens"
+                            # Build AND ILIKE conditions
+                            conds = " AND ".join(["(p.name || ' ' || s.package_size) ILIKE %s" for _ in tokens])
+                            params = [f"%{t}%" for t in tokens]
+                            cur.execute(
+                                f"""
+                                SELECT s.sku_id, s.base_price
+                                FROM Product_SKUs s
+                                JOIN Products p ON p.product_id = s.product_id
+                                WHERE {conds}
+                                ORDER BY s.sku_id ASC
+                                LIMIT 1
+                                """,
+                                params,
+                            )
+                            row = cur.fetchone()
+                            if not row:
+                                return None, None, None, "no_match"
                         sku_id_local, base_price = int(row[0]), float(row[1])
 
                         cost_price = round(base_price * 0.6, 2)
@@ -387,7 +474,7 @@ def create_app() -> Flask:
                         )
                         b_row_local = cur.fetchone()
                         conn.commit()
-                        return sku_id_local, b_row_local[0], b_row_local[1]
+                        return sku_id_local, b_row_local[0], b_row_local[1], None
 
             try:
                 result = _db_work()
@@ -407,10 +494,11 @@ def create_app() -> Flask:
                 else:
                     raise
 
-            if result == (None, None, None):
-                return jsonify({"error": f"SKU not found for name: {sku_name}"}), 404
+            if result[0] is None and result[1] is None and result[2] is None:
+                reason = result[3]
+                return jsonify({"error": f"SKU not found for name: {sku_name}", "reason": reason}), 404
 
-            sku_id, batch_id_val, new_qoh = result
+            sku_id, batch_id_val, new_qoh, _reason = result
 
             return (
                 jsonify(
@@ -428,7 +516,7 @@ def create_app() -> Flask:
                 201,
             )
         except Exception as e:
-            return jsonify({"error": str(e)}), 400
+            return jsonify({"error": str(e), "reason": "unhandled_exception"}), 400
 
     @app.post("/api/login")
     def login():
@@ -654,6 +742,7 @@ def create_app() -> Flask:
                                    s.package_size,
                                    s.unit_type,
                                    s.base_price,
+                                   COALESCE(inv.available_stock, 0) AS available_stock,
                                    ROUND(
                                        s.base_price * (1 - COALESCE((
                                            SELECT MAX(r.discount_percentage)
@@ -666,6 +755,11 @@ def create_app() -> Flask:
                             FROM Cart_Items ci
                             JOIN Product_SKUs s ON s.sku_id = ci.sku_id
                             JOIN Products p ON p.product_id = s.product_id
+                            LEFT JOIN (
+                                SELECT b.sku_id, SUM(b.quantity_on_hand) AS available_stock
+                                FROM Inventory_Batches b
+                                GROUP BY b.sku_id
+                            ) inv ON inv.sku_id = ci.sku_id
                             WHERE ci.cart_id = %s
                             ORDER BY ci.cart_item_id
                             """,
@@ -690,6 +784,11 @@ def create_app() -> Flask:
                                 rec["quantity"] = int(rec["quantity"])
                             except Exception:
                                 pass
+                            if rec.get("available_stock") is not None:
+                                try:
+                                    rec["available_stock"] = int(rec["available_stock"])
+                                except Exception:
+                                    pass
                             total_quantity += rec["quantity"]
                             total_price += rec["quantity"] * rec["effective_price"]
                             items.append(rec)
@@ -747,6 +846,12 @@ def create_app() -> Flask:
                             cur.execute("INSERT INTO Carts(user_id) VALUES (%s) RETURNING cart_id", (user_id,))
                             row = cur.fetchone()
                         cart_id = int(row[0])
+                        # Determine available stock for sku
+                        cur.execute("SELECT COALESCE(SUM(quantity_on_hand),0) FROM Inventory_Batches WHERE sku_id = %s", (sku_id,))
+                        avail_row = cur.fetchone()
+                        available = int(avail_row[0]) if avail_row and avail_row[0] is not None else 0
+                        if quantity > available:
+                            return {"stock_error": True, "available": available, "requested": quantity, "sku_id": sku_id}
                         if quantity == 0:
                             cur.execute("DELETE FROM Cart_Items WHERE cart_id = %s AND sku_id = %s RETURNING cart_item_id", (cart_id, sku_id))
                             deleted = cur.fetchone() is not None
@@ -768,6 +873,7 @@ def create_app() -> Flask:
                                    s.package_size,
                                    s.unit_type,
                                    s.base_price,
+                                   %s AS available_stock,
                                    ROUND(
                                        s.base_price * (1 - COALESCE((
                                            SELECT MAX(r.discount_percentage)
@@ -783,7 +889,7 @@ def create_app() -> Flask:
                             WHERE ci.cart_item_id = %s
                             LIMIT 1
                             """,
-                            (customer_id, customer_id, cart_item_id),
+                            (available, customer_id, customer_id, cart_item_id),
                         )
                         item_row = cur.fetchone(); cols = [d[0] for d in cur.description]
                         item = dict(zip(cols, item_row)) if item_row else None
@@ -805,6 +911,13 @@ def create_app() -> Flask:
                     result = _work()
                 else:
                     return jsonify({"error": msg}), 400
+            if isinstance(result, dict) and result.get("stock_error"):
+                return jsonify({
+                    "error": "Requested quantity exceeds available stock",
+                    "sku_id": result.get("sku_id"),
+                    "requested": result.get("requested"),
+                    "available": result.get("available"),
+                }), 409
             return jsonify(result)
         except Exception as e:
             return jsonify({"error": str(e)}), 400
@@ -842,10 +955,12 @@ def create_app() -> Flask:
                         if not cart_items:
                             raise ValueError("Cart is empty")
 
-                        # Create order
+                        # Create order (use customer_id, not user_id) to ensure it appears in /api/my-orders filtering
+                        if customer_id is None:
+                            raise ValueError("Customer account required for checkout")
                         cur.execute(
                             "INSERT INTO Orders(customer_id, status) VALUES (%s, 'pending') RETURNING order_id",
-                            (user_id,),
+                            (customer_id,),
                         )
                         order_id = int(cur.fetchone()[0])
 
@@ -880,7 +995,7 @@ def create_app() -> Flask:
                             # Lock batches ordered by expiry (FEFO)
                             cur.execute(
                                 """
-                                SELECT batch_id, quantity_on_hand
+                                SELECT batch_id, quantity_on_hand, cost_price
                                 FROM Inventory_Batches
                                 WHERE sku_id = %s AND quantity_on_hand > 0
                                 ORDER BY expiry_date ASC
@@ -894,7 +1009,12 @@ def create_app() -> Flask:
                                 raise ValueError(f"Insufficient stock for sku_id {sku_id}: needed {qty_needed}, available {total_available}")
 
                             remaining = qty_needed
-                            for batch_id, batch_qty in batches:
+                            # Enforce minimum margin over cost per batch when recording sale price
+                            try:
+                                min_margin = Decimal(os.getenv("MIN_PROFIT_MARGIN", "0.015"))
+                            except Exception:
+                                min_margin = Decimal("0.015")
+                            for batch_id, batch_qty, batch_cost in batches:
                                 if remaining <= 0:
                                     break
                                 take = batch_qty if batch_qty < remaining else remaining
@@ -904,16 +1024,21 @@ def create_app() -> Flask:
                                     (take, batch_id),
                                 )
                                 # Record order item
+                                # Floor sale price to ensure at least min margin over batch cost
+                                batch_cost_dec = Decimal(str(batch_cost))
+                                floor_price_dec = (batch_cost_dec * (Decimal(1) + min_margin)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                                sale_price_dec = effective_price_dec if effective_price_dec >= floor_price_dec else floor_price_dec
+                                sale_price = float(sale_price_dec)
                                 cur.execute(
                                     """
                                     INSERT INTO Order_Items(order_id, batch_id, quantity_ordered, sale_price)
                                     VALUES (%s, %s, %s, %s)
                                     RETURNING order_item_id
                                     """,
-                                    (order_id, batch_id, take, effective_price),
+                                    (order_id, batch_id, take, sale_price),
                                 )
                                 cur.fetchone()
-                                total_price += take * effective_price
+                                total_price += take * sale_price
                                 order_item_rows += 1
                                 remaining -= take
 
@@ -1016,6 +1141,384 @@ def create_app() -> Flask:
         except Exception as e:
             return jsonify({"error": str(e)}), 400
 
+    # Manual inventory CRUD endpoints
+    @app.post("/api/admin/inventory/batches")
+    @requires_auth(role="admin")
+    def admin_create_inventory_batch():
+        try:
+            body = request.get_json(force=True) or {}
+            sku_name = str(body.get("sku_name") or "").strip()
+            sku_id_in = body.get("sku_id")
+            batch_no = str(body.get("batch_no") or "").strip()
+            quantity = body.get("quantity")
+            expiry_date_raw = str(body.get("expiry_date") or "").strip()
+            cost_price_override_raw = body.get("cost_price")  # optional user-supplied cost per unit
+            if not ((sku_name or sku_id_in is not None) and batch_no and quantity and expiry_date_raw):
+                return jsonify({"error": "Missing required fields (sku_id or sku_name, batch_no, quantity, expiry_date)", "reason": "missing_fields"}), 400
+            try:
+                quantity = int(quantity)
+            except Exception:
+                return jsonify({"error": "quantity must be integer", "reason": "bad_quantity_type"}), 400
+            if quantity <= 0:
+                return jsonify({"error": "quantity must be > 0", "reason": "quantity_le_zero"}), 400
+            # Parse expiry date. Accept strict ISO (YYYY-MM-DD) and user-entered DD/MM/YYYY for convenience.
+            expiry_date = None
+            for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+                try:
+                    expiry_date = datetime.strptime(expiry_date_raw, fmt).date()
+                    # If DD/MM/YYYY was provided, convert to ISO semantics already handled by .date()
+                    break
+                except Exception:
+                    pass
+            if expiry_date is None:
+                return jsonify({"error": "expiry_date must be YYYY-MM-DD", "reason": "bad_expiry_format"}), 400
+
+            def _work():
+                with get_connection() as conn:
+                    with conn.cursor() as cur:
+                        sku_id_local = None
+                        base_price = None
+                        sku_name_result = sku_name  # preserve original (may be blank if sku_id provided)
+                        if sku_id_in is not None:
+                            try:
+                                sku_id_cast = int(sku_id_in)
+                            except Exception:
+                                return {"error": "Invalid sku_id format", "reason": "bad_sku_id_format"}
+                            cur.execute(
+                                """
+                                SELECT s.sku_id, s.base_price, (p.name || ' - ' || s.package_size) AS sku_name
+                                FROM Product_SKUs s
+                                JOIN Products p ON p.product_id = s.product_id
+                                WHERE s.sku_id = %s
+                                LIMIT 1
+                                """,
+                                (sku_id_cast,),
+                            )
+                            row = cur.fetchone()
+                            if not row:
+                                return {"error": "SKU not found for id", "reason": "sku_id_not_found"}
+                            sku_id_local, base_price, sku_name_db = int(row[0]), float(row[1]), row[2]
+                            if not sku_name_result:
+                                sku_name_result = sku_name_db
+                        else:
+                            cur.execute(
+                                """
+                                SELECT s.sku_id, s.base_price, (p.name || ' - ' || s.package_size) AS sku_name
+                                FROM Product_SKUs s
+                                JOIN Products p ON p.product_id = s.product_id
+                                WHERE (p.name || ' ' || s.package_size) = %s
+                                LIMIT 1
+                                """,
+                                (sku_name,),
+                            )
+                            row = cur.fetchone()
+                            if not row:
+                                return None
+                            sku_id_local, base_price, sku_name_db = int(row[0]), float(row[1]), row[2]
+                            sku_name_result = sku_name_db  # ensure canonical formatting with hyphen separator for UI consistency
+                        # Determine cost_price: explicit override if provided and valid, else default 60% heuristic
+                        cost_price = round(base_price * 0.6, 2)
+                        override_used = False
+                        if cost_price_override_raw is not None:
+                            try:
+                                cp_val = float(cost_price_override_raw)
+                                if cp_val < 0:
+                                    return {"error": "cost_price must be >= 0", "reason": "neg_cost_price"}
+                                cost_price = round(cp_val, 2)
+                                override_used = True
+                            except Exception:
+                                return {"error": "cost_price must be numeric", "reason": "bad_cost_price"}
+                        cur.execute(
+                            # On conflict: increment quantity; preserve existing cost_price unless override provided
+                            (
+                                "INSERT INTO Inventory_Batches(sku_id, batch_no, expiry_date, quantity_on_hand, cost_price) "
+                                "VALUES (%s, %s, %s, %s, %s) "
+                                "ON CONFLICT (sku_id, batch_no) DO UPDATE SET "
+                                "quantity_on_hand = Inventory_Batches.quantity_on_hand + EXCLUDED.quantity_on_hand" + (
+                                    ", cost_price = EXCLUDED.cost_price" if override_used else ""
+                                ) + " RETURNING batch_id, quantity_on_hand, cost_price"
+                            ),
+                            (sku_id_local, batch_no, expiry_date, quantity, cost_price),
+                        )
+                        b_row = cur.fetchone()
+                        conn.commit()
+                        return {
+                            "message": "Batch upserted",
+                            "batch": {
+                                "batch_id": int(b_row[0]),
+                                "sku_name": sku_name_result,
+                                "batch_no": batch_no,
+                                "expiry_date": expiry_date.isoformat(),
+                                "quantity_on_hand": int(b_row[1]),
+                                "cost_price": float(b_row[2]),
+                                "override_used": override_used,
+                            },
+                        }
+
+            try:
+                result = _work()
+            except Exception as e:
+                msg = str(e)
+                if (
+                    "SSL connection has been closed" in msg
+                    or "server closed the connection unexpectedly" in msg
+                    or "connection not open" in msg
+                ):
+                    try:
+                        reset_pool()
+                    except Exception:
+                        pass
+                    result = _work()
+                else:
+                    return jsonify({"error": msg}), 400
+            if isinstance(result, dict) and result.get("error"):
+                status = 404 if "not found" in result["error"] else 400
+                return jsonify(result), status
+            if result is None:
+                return jsonify({"error": f"SKU not found for name: {sku_name}", "reason": "sku_name_not_found"}), 404
+            return jsonify(result), 201
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+
+    @app.put("/api/admin/inventory/batches/<int:batch_id>")
+    @requires_auth(role="admin")
+    def admin_update_inventory_batch(batch_id: int):
+        try:
+            body = request.get_json(force=True) or {}
+            qty = body.get("quantity_on_hand")
+            expiry_raw = body.get("expiry_date")
+            cost_price = body.get("cost_price")
+            if qty is None and expiry_raw is None and cost_price is None:
+                return jsonify({"error": "No fields provided for update"}), 400
+            updates = []
+            params = []
+            if qty is not None:
+                try:
+                    qty = int(qty)
+                except Exception:
+                    return jsonify({"error": "quantity_on_hand must be integer"}), 400
+                if qty < 0:
+                    return jsonify({"error": "quantity_on_hand must be >= 0"}), 400
+                updates.append("quantity_on_hand = %s")
+                params.append(qty)
+            if expiry_raw is not None:
+                try:
+                    dt = datetime.strptime(str(expiry_raw), "%Y-%m-%d").date()
+                except Exception:
+                    return jsonify({"error": "expiry_date must be YYYY-MM-DD"}), 400
+                updates.append("expiry_date = %s")
+                params.append(dt)
+            if cost_price is not None:
+                try:
+                    cost_price = float(cost_price)
+                except Exception:
+                    return jsonify({"error": "cost_price must be number"}), 400
+                if cost_price < 0:
+                    return jsonify({"error": "cost_price must be >= 0"}), 400
+                updates.append("cost_price = %s")
+                params.append(cost_price)
+            params.append(batch_id)
+
+            def _work():
+                with get_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            f"UPDATE Inventory_Batches SET {', '.join(updates)} WHERE batch_id = %s RETURNING batch_id, sku_id, batch_no, expiry_date, quantity_on_hand, cost_price"
+                            , params,
+                        )
+                        row = cur.fetchone()
+                        if not row:
+                            return None
+                        cur.execute(
+                            """
+                            SELECT (p.name || ' - ' || s.package_size) AS sku_name
+                            FROM Inventory_Batches b
+                            JOIN Product_SKUs s ON s.sku_id = b.sku_id
+                            JOIN Products p ON p.product_id = s.product_id
+                            WHERE b.batch_id = %s
+                            LIMIT 1
+                            """,
+                            (batch_id,),
+                        )
+                        sku_row = cur.fetchone()
+                        conn.commit()
+                        return {
+                            "batch": {
+                                "batch_id": int(row[0]),
+                                "sku_name": sku_row[0] if sku_row else "",
+                                "batch_no": row[2],
+                                "expiry_date": row[3].isoformat() if row[3] else None,
+                                "quantity_on_hand": int(row[4]),
+                                "cost_price": float(row[5]),
+                            }
+                        }
+
+            try:
+                result = _work()
+            except Exception as e:
+                msg = str(e)
+                if (
+                    "SSL connection has been closed" in msg
+                    or "server closed the connection unexpectedly" in msg
+                    or "connection not open" in msg
+                ):
+                    try:
+                        reset_pool()
+                    except Exception:
+                        pass
+                    result = _work()
+                else:
+                    return jsonify({"error": msg}), 400
+            if result is None:
+                return jsonify({"error": "Batch not found"}), 404
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+
+    @app.delete("/api/admin/inventory/batches/<int:batch_id>")
+    @requires_auth(role="admin")
+    def admin_delete_inventory_batch(batch_id: int):
+        try:
+            def _work():
+                with get_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM Inventory_Batches WHERE batch_id = %s RETURNING batch_id", (batch_id,))
+                        row = cur.fetchone()
+                        if not row:
+                            return None
+                        conn.commit()
+                        return int(row[0])
+            try:
+                deleted_id = _work()
+            except Exception as e:
+                msg = str(e)
+                if (
+                    "SSL connection has been closed" in msg
+                    or "server closed the connection unexpectedly" in msg
+                    or "connection not open" in msg
+                ):
+                    try:
+                        reset_pool()
+                    except Exception:
+                        pass
+                    deleted_id = _work()
+                else:
+                    return jsonify({"error": msg}), 400
+            if deleted_id is None:
+                return jsonify({"error": "Batch not found"}), 404
+            return jsonify({"deleted": True, "batch_id": deleted_id})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+
+    # Product & SKU creation endpoints (admin)
+    @app.post("/api/admin/products")
+    @requires_auth(role="admin")
+    def admin_create_product():
+        try:
+            body = request.get_json(force=True) or {}
+            name = str(body.get("name") or "").strip()
+            manufacturer = str(body.get("manufacturer") or "").strip() or None
+            description = body.get("description")
+            if not name:
+                return jsonify({"error": "name is required", "reason": "missing_name"}), 400
+            def _work():
+                with get_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO Products(name, manufacturer, description) VALUES (%s, %s, %s) RETURNING product_id, name, manufacturer, description",
+                            (name, manufacturer, description),
+                        )
+                        row = cur.fetchone()
+                        conn.commit()
+                        return row
+            try:
+                row = _work()
+            except Exception as e:
+                msg = str(e)
+                if (
+                    "SSL connection has been closed" in msg
+                    or "server closed the connection unexpectedly" in msg
+                    or "connection not open" in msg
+                ):
+                    try: reset_pool()
+                    except Exception: pass
+                    row = _work()
+                else:
+                    return jsonify({"error": msg}), 400
+            return jsonify({
+                "product_id": int(row[0]),
+                "name": row[1],
+                "manufacturer": row[2],
+                "description": row[3],
+            }), 201
+        except Exception as e:
+            return jsonify({"error": str(e), "reason": "unhandled_exception"}), 400
+
+    @app.post("/api/admin/skus")
+    @requires_auth(role="admin")
+    def admin_create_sku():
+        try:
+            body = request.get_json(force=True) or {}
+            product_id = body.get("product_id")
+            package_size = str(body.get("package_size") or "").strip()
+            unit_type = str(body.get("unit_type") or "").strip()
+            base_price_raw = body.get("base_price")
+            if not (product_id and package_size and unit_type and base_price_raw is not None):
+                return jsonify({"error": "Missing required fields (product_id, package_size, unit_type, base_price)", "reason": "missing_fields"}), 400
+            try:
+                product_id = int(product_id)
+            except Exception:
+                return jsonify({"error": "product_id must be integer", "reason": "bad_product_id"}), 400
+            try:
+                base_price = float(base_price_raw)
+            except Exception:
+                return jsonify({"error": "base_price must be numeric", "reason": "bad_base_price"}), 400
+            if base_price < 0:
+                return jsonify({"error": "base_price must be >= 0", "reason": "neg_base_price"}), 400
+            def _work():
+                with get_connection() as conn:
+                    with conn.cursor() as cur:
+                        # validate product exists
+                        cur.execute("SELECT product_id FROM Products WHERE product_id = %s", (product_id,))
+                        if not cur.fetchone():
+                            return {"error": "Product not found", "reason": "product_not_found"}
+                        cur.execute(
+                            """
+                            INSERT INTO Product_SKUs(product_id, package_size, unit_type, base_price)
+                            VALUES (%s, %s, %s, %s)
+                            RETURNING sku_id, product_id, package_size, unit_type, base_price
+                            """,
+                            (product_id, package_size, unit_type, base_price),
+                        )
+                        row = cur.fetchone()
+                        conn.commit()
+                        return row
+            try:
+                row = _work()
+            except Exception as e:
+                msg = str(e)
+                if (
+                    "SSL connection has been closed" in msg
+                    or "server closed the connection unexpectedly" in msg
+                    or "connection not open" in msg
+                ):
+                    try: reset_pool()
+                    except Exception: pass
+                    row = _work()
+                else:
+                    return jsonify({"error": msg}), 400
+            if isinstance(row, dict) and row.get("error"):
+                return jsonify(row), 404
+            return jsonify({
+                "sku_id": int(row[0]),
+                "product_id": int(row[1]),
+                "package_size": row[2],
+                "unit_type": row[3],
+                "base_price": float(row[4]),
+            }), 201
+        except Exception as e:
+            return jsonify({"error": str(e), "reason": "unhandled_exception"}), 400
+
     @app.post("/api/admin/orders/<int:order_id>/status")
     @requires_auth(role="admin")
     def admin_update_order_status(order_id: int):
@@ -1058,6 +1561,243 @@ def create_app() -> Flask:
             if result is None:
                 return jsonify({"error": "Order not found"}), 404
             return jsonify(result)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+
+    @app.get("/api/admin/dashboard-stats")
+    @requires_auth(role="admin")
+    def admin_dashboard_stats():
+        try:
+            def _work():
+                with get_connection() as conn:
+                    with conn.cursor() as cur:
+                        # Total revenue & profit
+                        cur.execute(
+                            """
+                            SELECT
+                                COALESCE(SUM(oi.quantity_ordered * oi.sale_price),0) AS revenue,
+                                COALESCE(SUM(oi.quantity_ordered * (oi.sale_price - b.cost_price)),0) AS profit,
+                                COUNT(DISTINCT o.order_id) AS orders
+                            FROM Orders o
+                            JOIN Order_Items oi ON oi.order_id = o.order_id
+                            JOIN Inventory_Batches b ON b.batch_id = oi.batch_id
+                            WHERE o.status <> 'cancelled'
+                            """
+                        )
+                        rev_row = cur.fetchone() or (0,0,0)
+                        total_revenue, total_profit, total_orders = float(rev_row[0]), float(rev_row[1]), int(rev_row[2])
+
+                        # Total batches
+                        cur.execute("SELECT COUNT(*) FROM Inventory_Batches")
+                        total_batches = int(cur.fetchone()[0])
+
+                        # Expiring soon (30 days)
+                        cur.execute(
+                            "SELECT COUNT(*) FROM Inventory_Batches WHERE expiry_date <= CURRENT_DATE + INTERVAL '30 days' AND quantity_on_hand > 0"
+                        )
+                        expiring_soon = int(cur.fetchone()[0])
+
+                        # Low stock count (<=5)
+                        cur.execute(
+                            "SELECT COUNT(*) FROM Inventory_Batches WHERE quantity_on_hand <= 5"
+                        )
+                        low_stock_count = int(cur.fetchone()[0])
+
+                        # Revenue & profit by day (last 14 days)
+                        cur.execute(
+                            """
+                            SELECT
+                                DATE(o.order_date) AS day,
+                                COALESCE(SUM(oi.quantity_ordered * oi.sale_price),0) AS revenue,
+                                COALESCE(SUM(oi.quantity_ordered * (oi.sale_price - b.cost_price)),0) AS profit
+                            FROM Orders o
+                            JOIN Order_Items oi ON oi.order_id = o.order_id
+                            JOIN Inventory_Batches b ON b.batch_id = oi.batch_id
+                            WHERE o.order_date >= CURRENT_DATE - INTERVAL '14 days'
+                              AND o.status <> 'cancelled'
+                            GROUP BY day
+                            ORDER BY day ASC
+                            """
+                        )
+                        daily_rows = cur.fetchall()
+                        daily = [
+                            {
+                                "day": r[0].isoformat(),
+                                "revenue": float(r[1]),
+                                "profit": float(r[2]),
+                            }
+                            for r in daily_rows
+                        ]
+
+                        # Revenue & profit by ISO week (last 8 weeks)
+                        cur.execute(
+                            """
+                            SELECT
+                                DATE_TRUNC('week', o.order_date)::date AS week_start,
+                                COALESCE(SUM(oi.quantity_ordered * oi.sale_price),0) AS revenue,
+                                COALESCE(SUM(oi.quantity_ordered * (oi.sale_price - b.cost_price)),0) AS profit
+                            FROM Orders o
+                            JOIN Order_Items oi ON oi.order_id = o.order_id
+                            JOIN Inventory_Batches b ON b.batch_id = oi.batch_id
+                            WHERE o.order_date >= CURRENT_DATE - INTERVAL '56 days'
+                              AND o.status <> 'cancelled'
+                            GROUP BY week_start
+                            ORDER BY week_start ASC
+                            """
+                        )
+                        week_rows = cur.fetchall()
+                        weekly = [
+                            {
+                                "week_start": r[0].isoformat(),
+                                "revenue": float(r[1]),
+                                "profit": float(r[2]),
+                            }
+                            for r in week_rows
+                        ]
+                        return {
+                            "total_revenue": total_revenue,
+                            "total_profit": total_profit,
+                            "total_orders": total_orders,
+                            "total_batches": total_batches,
+                            "expiring_soon": expiring_soon,
+                            "low_stock_count": low_stock_count,
+                            "daily": daily,
+                            "weekly": weekly,
+                        }
+            try:
+                stats = _work()
+            except Exception as e:
+                msg = str(e)
+                if (
+                    "SSL connection has been closed" in msg
+                    or "server closed the connection unexpectedly" in msg
+                    or "connection not open" in msg
+                ):
+                    try:
+                        reset_pool()
+                    except Exception:
+                        pass
+                    stats = _work()
+                else:
+                    return jsonify({"error": msg}), 400
+            return jsonify(stats)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+
+    @app.get("/api/admin/orders/<int:order_id>/items")
+    @requires_auth(role="admin")
+    def admin_order_items(order_id: int):
+        try:
+            def _work():
+                with get_connection() as conn:
+                    with conn.cursor() as cur:
+                        # Ensure order exists
+                        cur.execute("SELECT order_id, customer_id, order_date, status FROM Orders WHERE order_id = %s", (order_id,))
+                        order_row = cur.fetchone()
+                        if not order_row:
+                            return None
+
+                        cur.execute(
+                            """
+                            SELECT 
+                                oi.order_item_id,
+                                oi.quantity_ordered,
+                                oi.sale_price,
+                                b.batch_id,
+                                b.batch_no,
+                                b.cost_price,
+                                s.sku_id,
+                                s.base_price,
+                                (p.name || ' - ' || s.package_size) AS sku_name
+                            FROM Order_Items oi
+                            JOIN Inventory_Batches b ON b.batch_id = oi.batch_id
+                            JOIN Product_SKUs s ON s.sku_id = b.sku_id
+                            JOIN Products p ON p.product_id = s.product_id
+                            WHERE oi.order_id = %s
+                            ORDER BY oi.order_item_id ASC
+                            """,
+                            (order_id,),
+                        )
+                        rows = cur.fetchall() or []
+
+                        items = []
+                        total_qty = 0
+                        total_price = Decimal("0.00")
+                        total_profit = Decimal("0.00")
+                        for r in rows:
+                            (
+                                order_item_id,
+                                qty,
+                                sale_price,
+                                batch_id,
+                                batch_no,
+                                cost_price,
+                                sku_id,
+                                base_price,
+                                sku_name,
+                            ) = r
+                            qty_i = int(qty)
+                            sp = Decimal(str(sale_price))
+                            cp = Decimal(str(cost_price))
+                            bp = Decimal(str(base_price)) if base_price is not None else Decimal("0")
+                            disc_pct = float(0)
+                            if bp and bp > 0:
+                                disc_pct = float((Decimal(1) - (sp / bp)) * Decimal(100))
+                            line_total = sp * qty_i
+                            line_profit = (sp - cp) * qty_i
+                            total_qty += qty_i
+                            total_price += line_total
+                            total_profit += line_profit
+                            items.append({
+                                "order_item_id": int(order_item_id),
+                                "sku_id": int(sku_id),
+                                "sku_name": sku_name,
+                                "batch_id": int(batch_id),
+                                "batch_no": batch_no,
+                                "quantity": qty_i,
+                                "base_price": float(bp),
+                                "sale_price": float(sp),
+                                "cost_price": float(cp),
+                                "discount_pct": round(disc_pct, 2),
+                                "line_total": float(line_total),
+                                "line_profit": float(line_profit),
+                            })
+
+                        result = {
+                            "order": {
+                                "order_id": int(order_row[0]),
+                                "customer_id": int(order_row[1]),
+                                "order_date": order_row[2].isoformat() if order_row[2] else None,
+                                "status": order_row[3],
+                            },
+                            "items": items,
+                            "totals": {
+                                "total_quantity": int(total_qty),
+                                "total_price": float(total_price),
+                                "total_profit": float(total_profit),
+                            }
+                        }
+                        return result
+
+            try:
+                data = _work()
+            except Exception as e:
+                msg = str(e)
+                if (
+                    "SSL connection has been closed" in msg
+                    or "server closed the connection unexpectedly" in msg
+                    or "connection not open" in msg
+                ):
+                    try:
+                        reset_pool()
+                    except Exception:
+                        pass
+                    data = _work()
+                else:
+                    return jsonify({"error": msg}), 400
+            if data is None:
+                return jsonify({"error": "Order not found"}), 404
+            return jsonify(data)
         except Exception as e:
             return jsonify({"error": str(e)}), 400
     return app
