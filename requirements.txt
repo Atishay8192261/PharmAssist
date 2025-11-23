@@ -26,3 +26,9 @@ bcrypt>=4.1.2
 
 # JWT for auth
 PyJWT>=2.9.0
+
+# Compression
+Flask-Compress>=1.15
+
+# Optional Redis cache backend
+redis>=5.0.0

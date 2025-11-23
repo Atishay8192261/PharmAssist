@@ -1,7 +1,8 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { api } from "@/lib/api";
+import { useState } from "react";
+import { useDebounce } from "@/hooks/use-debounce";
+import { useInventory } from "@/hooks/useInventory";
 import type { AdminInventoryResponse } from "@/lib/types";
 import { Card, CardContent } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -15,9 +16,11 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 export default function InventoryViewPage() {
-  const [data, setData] = useState<AdminInventoryResponse | null>(null);
-  const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
+  const debouncedSearch = useDebounce(search, 300);
+  const [page, setPage] = useState(1);
+  const [filterServer, setFilterServer] = useState<string>("");
+  const { inventory, total, totalPages, loading, error, refresh } = useInventory({ page, limit: 25, search: debouncedSearch, filter: filterServer });
   const [filter, setFilter] = useState<"all" | "low-stock" | "critical" | "expiring" | "recent">("all");
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editQuantity, setEditQuantity] = useState<number | "">("");
@@ -26,24 +29,10 @@ export default function InventoryViewPage() {
   const [saving, setSaving] = useState(false);
   const [deletingId, setDeletingId] = useState<number | null>(null);
 
-  const load = async () => {
-    try {
-      const res = await api.getAdminInventory();
-      setData(res);
-    } catch (error: unknown) {
-      let msg = 'Failed to load inventory';
-      if (error && typeof error === 'object' && 'message' in error) {
-        msg = String((error as { message?: unknown }).message || msg);
-      }
-      toast.error("Error", { description: msg });
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    load();
-  }, []);
+  if (error) {
+    const msg = (error as any)?.message || 'Failed to load inventory';
+    toast.error("Error", { description: msg });
+  }
 
   const beginEdit = (batch_id: number, quantity: number, expiry_date: string, cost_price: number) => {
     setEditingId(batch_id);
@@ -62,14 +51,15 @@ export default function InventoryViewPage() {
     if (editingId == null) return;
     setSaving(true);
     try {
-      await api.updateInventoryBatch(editingId, {
+      // optimistic UI could be added later
+      await import("@/lib/api").then(m => m.api.updateInventoryBatch(editingId, {
         quantity_on_hand: typeof editQuantity === "string" ? parseInt(editQuantity) : editQuantity,
         expiry_date: editExpiry,
         cost_price: typeof editCostPrice === "string" ? parseFloat(editCostPrice) : editCostPrice,
-      });
+      }));
       toast.success("Batch updated");
       cancelEdit();
-      load();
+      refresh();
     } catch (err: unknown) {
       let msg = 'Could not update batch';
       if (err && typeof err === 'object' && 'message' in err) {
@@ -85,9 +75,9 @@ export default function InventoryViewPage() {
     if (!confirm("Delete this batch?")) return;
     setDeletingId(batch_id);
     try {
-      await api.deleteInventoryBatch(batch_id);
+      await import("@/lib/api").then(m => m.api.deleteInventoryBatch(batch_id));
       toast.success("Batch deleted");
-      load();
+      refresh();
     } catch (err: unknown) {
       let msg = 'Could not delete batch';
       if (err && typeof err === 'object' && 'message' in err) {
@@ -100,7 +90,7 @@ export default function InventoryViewPage() {
   };
 
   const filteredBatches =
-    data?.batches.filter((batch) => {
+    inventory.filter((batch) => {
       const matchesSearch =
         batch.sku_name.toLowerCase().includes(search.toLowerCase()) ||
         batch.batch_no.toLowerCase().includes(search.toLowerCase());
@@ -113,7 +103,7 @@ export default function InventoryViewPage() {
       }
       if (filter === "recent") {
         // Treat top 10 highest batch_id as recently added
-        const topSorted = [...(data?.batches || [])]
+        const topSorted = [...inventory]
           .sort((a, b) => b.batch_id - a.batch_id)
           .slice(0, 10)
           .map(b => b.batch_id);
@@ -163,28 +153,28 @@ export default function InventoryViewPage() {
         <Badge
           variant={filter === "low-stock" ? "default" : "outline"}
           className="cursor-pointer"
-          onClick={() => setFilter("low-stock")}
+          onClick={() => { setFilter("low-stock"); setFilterServer("low-stock"); setPage(1); }}
         >
           Low Stock
         </Badge>
         <Badge
           variant={filter === "critical" ? "default" : "outline"}
           className="cursor-pointer"
-          onClick={() => setFilter("critical")}
+          onClick={() => { setFilter("critical"); setFilterServer("critical"); setPage(1); }}
         >
           Critical Stock
         </Badge>
         <Badge
           variant={filter === "expiring" ? "default" : "outline"}
           className="cursor-pointer"
-          onClick={() => setFilter("expiring")}
+          onClick={() => { setFilter("expiring"); setFilterServer("expiring"); setPage(1); }}
         >
           Expiring Soon
         </Badge>
         <Badge
           variant={filter === "recent" ? "default" : "outline"}
           className="cursor-pointer"
-          onClick={() => setFilter("recent")}
+          onClick={() => { setFilter("recent"); setFilterServer("recent"); setPage(1); }}
         >
           Recently Added
         </Badge>
@@ -310,6 +300,16 @@ export default function InventoryViewPage() {
               )}
             </TableBody>
           </Table>
+          <div className="flex items-center justify-between p-4 border-t text-sm">
+            <span>
+              Page {page} of {totalPages} • {total} total
+            </span>
+            <div className="flex gap-2">
+              <Button size="sm" variant="outline" disabled={page <= 1} onClick={() => setPage(p => p - 1)}>Prev</Button>
+              <Button size="sm" variant="outline" disabled={page >= totalPages} onClick={() => setPage(p => p + 1)}>Next</Button>
+              <Button size="sm" variant="secondary" onClick={() => refresh()}>Refresh</Button>
+            </div>
+          </div>
         </CardContent>
       </Card>
     </div>

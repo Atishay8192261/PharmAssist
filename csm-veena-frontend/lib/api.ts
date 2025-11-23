@@ -182,8 +182,14 @@ class ApiClient {
   }
 
   // Inventory
-  async getAdminInventory(): Promise<AdminInventoryResponse> {
-    return this.fetch<AdminInventoryResponse>("/api/admin/inventory")
+  async getAdminInventory(params: { page?: number; limit?: number; search?: string; filter?: string } = {}): Promise<AdminInventoryResponse> {
+    const query = new URLSearchParams()
+    if (params.page) query.set("page", String(params.page))
+    if (params.limit) query.set("limit", String(params.limit))
+    if (params.search) query.set("search", params.search)
+    if (params.filter) query.set("filter", params.filter)
+    const qs = query.toString()
+    return this.fetch<AdminInventoryResponse>(`/api/admin/inventory${qs ? "?" + qs : ""}`)
   }
 
   async getAdminDashboardStats(): Promise<import("./types").AdminDashboardStats> {

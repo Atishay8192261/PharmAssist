@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
 import google.generativeai as genai
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, g
 from flask_cors import CORS
 from .db import init_pool, get_connection, reset_pool
 from psycopg import IsolationLevel
@@ -13,6 +13,22 @@ from dotenv import load_dotenv
 import bcrypt
 import jwt
 from functools import wraps
+import threading
+import time
+import hashlib
+from typing import Any
+try:
+    from .cache import cache_get, cache_set, cache_invalidate, cache_memo, cache_metrics
+except ImportError:
+    # Fallback no-op implementations if cache module missing
+    def cache_get(key):
+        return None
+    def cache_set(key, value, ttl):
+        return None
+    def cache_invalidate(prefix):
+        return None
+    def cache_memo(key, ttl, fn):
+        return fn()
 
 
 def _make_access_token(payload: dict) -> str:
@@ -51,12 +67,357 @@ def create_app() -> Flask:
     app = Flask(__name__)
     CORS(app, resources={r"/*": {"origins": "*"}})
 
+    # Compression (gzip/brotli) optional via env ENABLE_COMPRESSION=1
+    if os.getenv("ENABLE_COMPRESSION") == "1":
+        try:
+            from flask_compress import Compress
+            Compress(app)
+        except Exception:
+            pass
+
+    # Observability: optional timing middleware controlled by LOG_TIMING=1
+    if os.getenv("LOG_TIMING") == "1":
+        try:
+            SLOW_REQUEST_MS = int(os.getenv("SLOW_REQUEST_MS", "500"))
+        except Exception:
+            SLOW_REQUEST_MS = 500
+        try:
+            SLOW_DB_MS = int(os.getenv("SLOW_DB_MS", "400"))
+        except Exception:
+            SLOW_DB_MS = 400
+
+        @app.before_request
+        def _timing_start():  # type: ignore
+            try:
+                g._req_start = time.perf_counter()
+                g.db_time_ms = 0.0
+            except Exception:
+                pass
+
+        @app.after_request
+        def _timing_end(resp):  # type: ignore
+            try:
+                start = getattr(g, "_req_start", None)
+                if start is not None:
+                    dur_ms = (time.perf_counter() - start) * 1000.0
+                    db_ms = float(getattr(g, "db_time_ms", 0.0) or 0.0)
+                    resp.headers["X-Request-Duration"] = f"{dur_ms:.2f}ms"
+                    resp.headers["X-DB-Time"] = f"{db_ms:.2f}ms"
+                    # Server-Timing compatible header for browsers/clients
+                    resp.headers["Server-Timing"] = f"app;dur={dur_ms:.2f}, db;dur={db_ms:.2f}"
+                    # Slow request logging
+                    if dur_ms >= SLOW_REQUEST_MS:
+                        app.logger.warning(
+                            "SLOW_REQUEST method=%s path=%s status=%s dur_ms=%.2f db_ms=%.2f",
+                            request.method,
+                            request.path,
+                            getattr(resp, "status_code", 0),
+                            dur_ms,
+                            db_ms,
+                        )
+                    # High DB time logging
+                    if db_ms >= SLOW_DB_MS:
+                        app.logger.warning(
+                            "SLOW_DB method=%s path=%s status=%s db_ms=%.2f total_ms=%.2f",
+                            request.method,
+                            request.path,
+                            getattr(resp, "status_code", 0),
+                            db_ms,
+                            dur_ms,
+                        )
+            except Exception:
+                pass
+            return resp
+
     # Initialize DB pool early (will no-op if DATABASE_URL missing)
     try:
         init_pool()
     except Exception:
         # In dev without DB, health still works
         pass
+
+    # Optional index bootstrap (controlled by RUN_INDEX_BOOTSTRAP=1)
+    if os.getenv("RUN_INDEX_BOOTSTRAP") == "1":
+        try:
+            with get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Enable pg_trgm for faster ILIKE searches
+                    cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+                    # Trigram indexes for product search related columns
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_products_name_trgm ON Products USING gin (name gin_trgm_ops)")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_products_manufacturer_trgm ON Products USING gin (manufacturer gin_trgm_ops)")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_skus_package_size_trgm ON Product_SKUs USING gin (package_size gin_trgm_ops)")
+                    # Partial index excluding cancelled orders for dashboard aggregates
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_not_cancelled ON Orders(order_date) WHERE status <> 'cancelled'")
+                    # FEFO batch selection optimization (only batches with stock)
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_batches_sku_expiry_qoh ON Inventory_Batches (sku_id, expiry_date) WHERE quantity_on_hand > 0")
+                    # Pricing rule indexes to optimize discount subquery pattern
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_pricing_rules_sku_minqty ON Pricing_Rules (sku_id, min_quantity) WHERE customer_id IS NULL AND sku_id IS NOT NULL")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_pricing_rules_cust_minqty ON Pricing_Rules (customer_id, min_quantity) WHERE sku_id IS NULL AND customer_id IS NOT NULL")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_pricing_rules_sku_cust_minqty ON Pricing_Rules (sku_id, customer_id, min_quantity) WHERE sku_id IS NOT NULL AND customer_id IS NOT NULL")
+                    # Inventory summary table + maintenance functions/triggers
+                    cur.execute("""
+                    CREATE TABLE IF NOT EXISTS Inventory_Summary (
+                        sku_id INT PRIMARY KEY REFERENCES Product_SKUs(sku_id) ON DELETE CASCADE,
+                        total_on_hand BIGINT NOT NULL DEFAULT 0,
+                        earliest_expiry DATE
+                    )
+                    """)
+                    # Refresh function (recomputes one sku's summary or deletes if no batches remain)
+                    cur.execute("""
+                    CREATE OR REPLACE FUNCTION inventory_summary_refresh(p_sku_id INT) RETURNS VOID AS $$
+                    DECLARE
+                        v_count INT;
+                    BEGIN
+                        SELECT COUNT(*) INTO v_count FROM Inventory_Batches WHERE sku_id = p_sku_id;
+                        IF v_count = 0 THEN
+                            DELETE FROM Inventory_Summary WHERE sku_id = p_sku_id;
+                            RETURN;
+                        END IF;
+                        WITH agg AS (
+                            SELECT sku_id,
+                                   COALESCE(SUM(quantity_on_hand),0) AS total_on_hand,
+                                   MIN(expiry_date) FILTER (WHERE quantity_on_hand > 0) AS earliest_expiry
+                            FROM Inventory_Batches
+                            WHERE sku_id = p_sku_id
+                            GROUP BY sku_id
+                        )
+                        INSERT INTO Inventory_Summary(sku_id,total_on_hand,earliest_expiry)
+                        SELECT sku_id,total_on_hand,earliest_expiry FROM agg
+                        ON CONFLICT (sku_id) DO UPDATE SET
+                          total_on_hand = EXCLUDED.total_on_hand,
+                          earliest_expiry = EXCLUDED.earliest_expiry;
+                    END; $$ LANGUAGE plpgsql;
+                    """)
+                    # Trigger function
+                    cur.execute("""
+                    CREATE OR REPLACE FUNCTION trg_inventory_batches_refresh() RETURNS trigger AS $$
+                    BEGIN
+                        IF TG_OP = 'DELETE' THEN
+                            PERFORM inventory_summary_refresh(OLD.sku_id);
+                        ELSE
+                            PERFORM inventory_summary_refresh(NEW.sku_id);
+                        END IF;
+                        RETURN NULL;
+                    END; $$ LANGUAGE plpgsql;
+                    """)
+                    # Attach triggers (idempotent by name)
+                    cur.execute("""
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_trigger WHERE tgname = 'inventory_batches_refresh_ai'
+                        ) THEN
+                            EXECUTE 'CREATE TRIGGER inventory_batches_refresh_ai AFTER INSERT ON Inventory_Batches FOR EACH ROW EXECUTE FUNCTION trg_inventory_batches_refresh()';
+                        END IF;
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_trigger WHERE tgname = 'inventory_batches_refresh_au'
+                        ) THEN
+                            EXECUTE 'CREATE TRIGGER inventory_batches_refresh_au AFTER UPDATE ON Inventory_Batches FOR EACH ROW EXECUTE FUNCTION trg_inventory_batches_refresh()';
+                        END IF;
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_trigger WHERE tgname = 'inventory_batches_refresh_ad'
+                        ) THEN
+                            EXECUTE 'CREATE TRIGGER inventory_batches_refresh_ad AFTER DELETE ON Inventory_Batches FOR EACH ROW EXECUTE FUNCTION trg_inventory_batches_refresh()';
+                        END IF;
+                    END; $$;
+                    """)
+                    # Initial backfill of summary (only for skus not yet present)
+                    cur.execute("""
+                    INSERT INTO Inventory_Summary(sku_id,total_on_hand,earliest_expiry)
+                    SELECT b.sku_id,
+                           COALESCE(SUM(b.quantity_on_hand),0) AS total_on_hand,
+                           MIN(b.expiry_date) FILTER (WHERE b.quantity_on_hand > 0) AS earliest_expiry
+                    FROM Inventory_Batches b
+                    GROUP BY b.sku_id
+                    ON CONFLICT (sku_id) DO NOTHING
+                    """)
+                conn.commit()
+        except Exception as _e:
+            # Non-fatal: continue startup even if index creation fails
+            pass
+
+    # Optional dashboard pre-warm thread
+    if os.getenv("DASHBOARD_PREWARM") == "1":
+        def _compute_dashboard_stats():
+            with get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            COALESCE(SUM(oi.quantity_ordered * oi.sale_price),0) AS revenue,
+                            COALESCE(SUM(oi.quantity_ordered * (oi.sale_price - b.cost_price)),0) AS profit,
+                            COUNT(DISTINCT o.order_id) AS orders
+                        FROM Orders o
+                        JOIN Order_Items oi ON oi.order_id = o.order_id
+                        JOIN Inventory_Batches b ON b.batch_id = oi.batch_id
+                        WHERE o.status <> 'cancelled'
+                        """
+                    )
+                    rev_row = cur.fetchone() or (0,0,0)
+                    total_revenue, total_profit, total_orders = float(rev_row[0]), float(rev_row[1]), int(rev_row[2])
+
+                    cur.execute("SELECT COUNT(*) FROM Inventory_Batches")
+                    total_batches = int(cur.fetchone()[0])
+
+                    cur.execute(
+                        "SELECT COUNT(*) FROM Inventory_Batches WHERE expiry_date <= CURRENT_DATE + INTERVAL '30 days' AND quantity_on_hand > 0"
+                    )
+                    expiring_soon = int(cur.fetchone()[0])
+
+                    cur.execute(
+                        "SELECT COUNT(*) FROM Inventory_Batches WHERE quantity_on_hand <= 5"
+                    )
+                    low_stock_count = int(cur.fetchone()[0])
+
+                    cur.execute(
+                        """
+                        SELECT
+                            DATE(o.order_date) AS day,
+                            COALESCE(SUM(oi.quantity_ordered * oi.sale_price),0) AS revenue,
+                            COALESCE(SUM(oi.quantity_ordered * (oi.sale_price - b.cost_price)),0) AS profit
+                        FROM Orders o
+                        JOIN Order_Items oi ON oi.order_id = o.order_id
+                        JOIN Inventory_Batches b ON b.batch_id = oi.batch_id
+                        WHERE o.order_date >= CURRENT_DATE - INTERVAL '14 days'
+                          AND o.status <> 'cancelled'
+                        GROUP BY day
+                        ORDER BY day ASC
+                        """
+                    )
+                    daily_rows = cur.fetchall()
+                    daily = [
+                        {"day": r[0].isoformat(), "revenue": float(r[1]), "profit": float(r[2])}
+                        for r in daily_rows
+                    ]
+
+                    cur.execute(
+                        """
+                        SELECT
+                            DATE_TRUNC('week', o.order_date)::date AS week_start,
+                            COALESCE(SUM(oi.quantity_ordered * oi.sale_price),0) AS revenue,
+                            COALESCE(SUM(oi.quantity_ordered * (oi.sale_price - b.cost_price)),0) AS profit
+                        FROM Orders o
+                        JOIN Order_Items oi ON oi.order_id = o.order_id
+                        JOIN Inventory_Batches b ON b.batch_id = oi.batch_id
+                        WHERE o.order_date >= CURRENT_DATE - INTERVAL '56 days'
+                          AND o.status <> 'cancelled'
+                        GROUP BY week_start
+                        ORDER BY week_start ASC
+                        """
+                    )
+                    week_rows = cur.fetchall()
+                    weekly = [
+                        {"week_start": r[0].isoformat(), "revenue": float(r[1]), "profit": float(r[2])}
+                        for r in week_rows
+                    ]
+
+            return {
+                "total_revenue": total_revenue,
+                "total_profit": total_profit,
+                "total_orders": total_orders,
+                "total_batches": total_batches,
+                "expiring_soon": expiring_soon,
+                "low_stock_count": low_stock_count,
+                "daily": daily,
+                "weekly": weekly,
+            }
+
+        def _prewarm_loop():
+            interval = int(os.getenv("DASHBOARD_PREWARM_INTERVAL", "60"))
+            ttl = int(os.getenv("CACHE_TTL_DASHBOARD", "60"))
+            key = "dashboard:v1:stats"
+            while True:
+                try:
+                    stats = _compute_dashboard_stats()
+                    cache_set(key, stats, ttl)
+                except Exception:
+                    pass
+                time.sleep(interval)
+
+        t = threading.Thread(target=_prewarm_loop, name="dashboard-prewarm", daemon=True)
+        t.start()
+
+    # Optional products pre-warm thread (PRODUCTS_PREWARM=1)
+    if os.getenv("PRODUCTS_PREWARM") == "1":
+        def _products_prewarm_loop():
+            interval = int(os.getenv("PRODUCTS_PREWARM_INTERVAL", "120"))
+            ttl = int(os.getenv("CACHE_TTL_PRODUCTS", "30"))
+            # Common key variants to pre-populate
+            key_specs = [
+                {"quantity": 1, "page": 1, "limit": 20, "search": ""},
+            ]
+            while True:
+                for spec in key_specs:
+                    customer_id = None
+                    page = spec["page"]; limit = spec["limit"]; quantity = spec["quantity"]; search = spec["search"]
+                    cache_key = f"products:v1:cid={customer_id}:q={quantity}:page={page}:limit={limit}:search={search}"
+                    if cache_get(cache_key) is not None:
+                        continue
+                    try:
+                        with get_connection() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """
+                                    SELECT
+                                        p.product_id,
+                                        p.name AS product_name,
+                                        p.manufacturer,
+                                        p.description,
+                                        s.sku_id,
+                                        s.package_size,
+                                        s.unit_type,
+                                        s.base_price,
+                                        COALESCE(inv.total_on_hand,0) AS total_on_hand,
+                                        inv.earliest_expiry,
+                                        ROUND(
+                                            s.base_price * (1 - COALESCE((
+                                                SELECT MAX(r.discount_percentage)
+                                                FROM Pricing_Rules r
+                                                WHERE (r.sku_id IS NULL OR r.sku_id = s.sku_id)
+                                                  AND COALESCE(r.min_quantity, 1) <= %s
+                                                  AND (r.customer_id IS NULL OR r.customer_id = %s)
+                                            ), 0)/100.0),
+                                            2
+                                        ) AS effective_price
+                                    FROM Products p
+                                    JOIN Product_SKUs s ON s.product_id = p.product_id
+                                    LEFT JOIN Inventory_Summary inv ON inv.sku_id = s.sku_id
+                                    ORDER BY p.product_id, s.sku_id
+                                    LIMIT %s OFFSET %s
+                                    """,
+                                    (quantity, customer_id, limit, 0)
+                                )
+                                rows = cur.fetchall(); cols = [d[0] for d in cur.description]
+                                items = []
+                                for row in rows:
+                                    rec = dict(zip(cols, row))
+                                    try:
+                                        if rec.get("base_price") is not None:
+                                            rec["base_price"] = float(rec["base_price"])
+                                        if rec.get("effective_price") is not None:
+                                            rec["effective_price"] = float(rec["effective_price"])
+                                        if rec.get("total_on_hand") is not None:
+                                            rec["total_on_hand"] = int(rec["total_on_hand"])
+                                    except Exception:
+                                        pass
+                                    items.append(rec)
+                                response_body = {
+                                    "customer_id": customer_id,
+                                    "assumed_quantity_for_pricing": quantity,
+                                    "items": items,
+                                    "total_items": len(items),
+                                    "total_pages": 1,
+                                    "current_page": page,
+                                    "page_size": limit,
+                                    "search": search,
+                                }
+                                cache_set(cache_key, response_body, ttl)
+                    except Exception:
+                        pass
+                time.sleep(interval)
+        tp = threading.Thread(target=_products_prewarm_loop, name="products-prewarm", daemon=True)
+        tp.start()
 
     @app.get("/health")
     def health():
@@ -68,7 +429,25 @@ def create_app() -> Flask:
             db_ok = True
         except Exception:
             db_ok = False
-        return jsonify({"status": "ok", "db": db_ok})
+        resp = jsonify({"status": "ok", "db": db_ok})
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return resp
+
+    @app.get("/metrics")
+    def metrics():
+        # Simple JSON metrics; optionally output Prometheus format if METRICS_PROMETHEUS=1
+        m = {
+            "cache": cache_metrics(),
+        }
+        if os.getenv("METRICS_PROMETHEUS") == "1":
+            # Plain text exposition for Prometheus scrape
+            lines = [
+                f"app_cache_hits_total {m['cache']['hits']}",
+                f"app_cache_misses_total {m['cache']['misses']}",
+                f"app_cache_expired_total {m['cache']['expired']}",
+            ]
+            return ("\n".join(lines) + "\n", 200, {"Content-Type": "text/plain; version=0.0.4"})
+        return jsonify(m)
 
     @app.get("/api/products")
     def list_products():
@@ -156,8 +535,8 @@ def create_app() -> Flask:
             s.package_size,
             s.unit_type,
             s.base_price,
-            COALESCE(st.total_on_hand, 0) AS total_on_hand,
-            st.earliest_expiry,
+            COALESCE(inv.total_on_hand, 0) AS total_on_hand,
+            inv.earliest_expiry,
             ROUND(
                 s.base_price * (1 - COALESCE((
                     SELECT MAX(r.discount_percentage)
@@ -170,13 +549,7 @@ def create_app() -> Flask:
             ) AS effective_price
         FROM Products p
         JOIN Product_SKUs s ON s.product_id = p.product_id
-        LEFT JOIN (
-            SELECT b.sku_id,
-                   SUM(b.quantity_on_hand) AS total_on_hand,
-                   MIN(b.expiry_date) FILTER (WHERE b.quantity_on_hand > 0) AS earliest_expiry
-            FROM Inventory_Batches b
-            GROUP BY b.sku_id
-        ) st ON st.sku_id = s.sku_id
+        LEFT JOIN Inventory_Summary inv ON inv.sku_id = s.sku_id
         {where_sql}
         ORDER BY p.product_id, s.sku_id
         LIMIT %s OFFSET %s
@@ -210,6 +583,12 @@ def create_app() -> Flask:
                     rows_local = cur.fetchall()
                     cols_local = [desc[0] for desc in cur.description]
                     return total_items_local, rows_local, cols_local
+
+        cache_ttl = int(os.getenv("CACHE_TTL_PRODUCTS", "30"))
+        cache_key = f"products:v1:cid={customer_id}:q={quantity}:page={page}:limit={limit}:search={search or ''}"
+        cached = cache_get(cache_key)
+        if cached is not None:
+            return jsonify(cached)
 
         try:
             total_items, rows, cols = _work()
@@ -249,7 +628,7 @@ def create_app() -> Flask:
             items.append(rec)
 
         total_pages = (total_items + limit - 1) // limit if limit > 0 else 0
-        return jsonify({
+        response_body = {
             "customer_id": customer_id,
             "assumed_quantity_for_pricing": quantity,
             "items": items,
@@ -258,7 +637,11 @@ def create_app() -> Flask:
             "current_page": page,
             "page_size": limit,
             "search": search,
-        })
+        }
+        cache_set(cache_key, response_body, cache_ttl)
+        resp = jsonify(response_body)
+        resp.headers["Cache-Control"] = "private, max-age=30"
+        return resp
         
 
     @app.post("/api/orders")
@@ -303,15 +686,19 @@ def create_app() -> Flask:
                     pass
                 row = _work()
             else:
-                message = msg
-                if "Insufficient stock" in message:
-                    return jsonify({"error": message}), 409
-                return jsonify({"error": message}), 400
+                if "Insufficient stock" in msg:
+                    return jsonify({"error": msg}), 409
+                return jsonify({"error": msg}), 400
 
         if not row or len(row) < 3:
             return jsonify({"error": "Unexpected database response"}), 500
 
         order_id, order_item_id, sale_price = row[0], row[1], float(row[2])
+        # Invalidate caches impacted by inventory and pricing changes due to this order placement
+        cache_invalidate("inventory:v1")
+        cache_invalidate("dashboard:v1")
+        cache_invalidate("products:v1")
+
         return (
             jsonify(
                 {
@@ -500,21 +887,20 @@ def create_app() -> Flask:
 
             sku_id, batch_id_val, new_qoh, _reason = result
 
-            return (
-                jsonify(
-                    {
-                        "message": "Inventory batch added",
-                        "batch_id": int(batch_id_val),
-                        "sku_id": sku_id,
-                        "batch_no": batch_no,
-                        "quantity_added": quantity,
-                        "new_quantity_on_hand": int(new_qoh),
-                        "expiry_date": expiry_date.isoformat(),
-                        "source": model_name,
-                    }
-                ),
-                201,
-            )
+            ai_body = {
+                "message": "Inventory batch added",
+                "batch_id": int(batch_id_val),
+                "sku_id": sku_id,
+                "batch_no": batch_no,
+                "quantity_added": quantity,
+                "new_quantity_on_hand": int(new_qoh),
+                "expiry_date": expiry_date.isoformat(),
+                "source": model_name,
+            }
+            cache_invalidate("inventory:v1")
+            cache_invalidate("dashboard:v1")
+            cache_invalidate("products:v1")
+            return jsonify(ai_body), 201
         except Exception as e:
             return jsonify({"error": str(e), "reason": "unhandled_exception"}), 400
 
@@ -1079,12 +1465,68 @@ def create_app() -> Flask:
     @requires_auth(role="admin")
     def admin_inventory_batches():
         try:
+            # Query params
+            page = request.args.get("page", default=1, type=int)
+            limit = request.args.get("limit", default=50, type=int)
+            search = (request.args.get("search") or "").strip()
+            flt = (request.args.get("filter") or "").strip().lower()  # low-stock|critical|expiring|recent|''
+
+            if page <= 0:
+                page = 1
+            if limit <= 0 or limit > 200:
+                limit = 50
+
+            # Build dynamic WHERE conditions
+            conditions = []
+            params: list[Any] = []
+            if search:
+                tokens = [t for t in re.split(r"\s+", search) if t]
+                for t in tokens:
+                    like = f"%{t}%"
+                    conditions.append("((p.name || ' - ' || s.package_size) ILIKE %s OR b.batch_no ILIKE %s)")
+                    params.extend([like, like])
+            if flt == "low-stock":
+                conditions.append("b.quantity_on_hand < 10")
+            elif flt == "critical":
+                # Match dashboard definition (<=5)
+                conditions.append("b.quantity_on_hand <= 5")
+            elif flt == "expiring":
+                conditions.append("b.expiry_date <= CURRENT_DATE + INTERVAL '30 days' AND b.quantity_on_hand > 0")
+            elif flt == "recent":
+                conditions.append("b.batch_id > (SELECT COALESCE(MAX(batch_id)-50,0) FROM Inventory_Batches)")
+
+            where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
+
+            # Cache key includes query params
+            cache_key = f"inventory:v1:search={search}:filter={flt}:page={page}:limit={limit}"
+            cache_ttl = int(os.getenv("CACHE_TTL_INVENTORY", "30"))
+            cached = cache_get(cache_key)
+            if cached is not None:
+                # Support conditional request with ETag
+                etag_in = request.headers.get("If-None-Match")
+                if etag_in and cached.get("etag") == etag_in:
+                    return ("", 304, {"ETag": etag_in})
+                return jsonify(cached), 200
+
             def _work():
                 with get_connection() as conn:
                     with conn.cursor() as cur:
+                        # Count total matching
                         cur.execute(
-                            
-                            """
+                            f"""
+                            SELECT COUNT(*)
+                            FROM Inventory_Batches b
+                            JOIN Product_SKUs s ON s.sku_id = b.sku_id
+                            JOIN Products p ON p.product_id = s.product_id
+                            {where_clause}
+                            """,
+                            tuple(params),
+                        )
+                        total_matching = int(cur.fetchone()[0])
+
+                        offset = (page - 1) * limit
+                        cur.execute(
+                            f"""
                             SELECT 
                                 b.batch_id,
                                 (p.name || ' - ' || s.package_size) AS sku_name,
@@ -1095,8 +1537,11 @@ def create_app() -> Flask:
                             FROM Inventory_Batches b
                             JOIN Product_SKUs s ON s.sku_id = b.sku_id
                             JOIN Products p ON p.product_id = s.product_id
+                            {where_clause}
                             ORDER BY sku_name ASC, b.expiry_date ASC
-                            """
+                            LIMIT %s OFFSET %s
+                            """,
+                            tuple(params + [limit, offset]),
                         )
                         rows = cur.fetchall()
                         cols = [d[0] for d in cur.description]
@@ -1119,10 +1564,44 @@ def create_app() -> Flask:
                                 except Exception:
                                     pass
                             items.append(rec)
-                        return items
+
+                        # ETag components
+                        cur.execute(
+                            f"""
+                            SELECT COALESCE(MAX(b.batch_id),0) AS max_id,
+                                   COUNT(*) AS cnt,
+                                   COALESCE(MAX(b.expiry_date), CURRENT_DATE) AS last_expiry
+                            FROM Inventory_Batches b
+                            JOIN Product_SKUs s ON s.sku_id = b.sku_id
+                            JOIN Products p ON p.product_id = s.product_id
+                            {where_clause}
+                            """,
+                            tuple(params),
+                        )
+                        meta_row = cur.fetchone() or (0,0,datetime.utcnow().date())
+                        max_id, cnt, last_expiry = meta_row
+                        etag_source = f"{max_id}:{cnt}:{search}:{flt}:{total_matching}".encode()
+                        etag = hashlib.sha1(etag_source).hexdigest()
+
+                        total_pages = (total_matching + limit - 1) // limit if limit > 0 else 0
+                        last_modified = (
+                            last_expiry.isoformat() + "T00:00:00Z" if hasattr(last_expiry, 'isoformat') else datetime.utcnow().isoformat() + 'Z'
+                        )
+
+                        return {
+                            "batches": items,
+                            "total_batches": total_matching,
+                            "total_pages": total_pages,
+                            "current_page": page,
+                            "page_size": limit,
+                            "filter": flt,
+                            "search": search,
+                            "etag": etag,
+                            "last_modified": last_modified,
+                        }
 
             try:
-                items = _work()
+                response_body = _work()
             except Exception as e:
                 msg = str(e)
                 if (
@@ -1134,10 +1613,21 @@ def create_app() -> Flask:
                         reset_pool()
                     except Exception:
                         pass
-                    items = _work()
+                    response_body = _work()
                 else:
                     return jsonify({"error": msg}), 400
-            return jsonify({"batches": items, "total_batches": len(items)})
+
+            cache_set(cache_key, response_body, cache_ttl)
+            etag = response_body.get("etag")
+            headers = {
+                "ETag": etag,
+                "Cache-Control": "private, max-age=30",
+                "Last-Modified": response_body.get("last_modified", datetime.utcnow().isoformat()+"Z"),
+            }
+            etag_in = request.headers.get("If-None-Match")
+            if etag_in and etag_in == etag:
+                return ("", 304, headers)
+            return jsonify(response_body), 200, headers
         except Exception as e:
             return jsonify({"error": str(e)}), 400
 
@@ -1276,6 +1766,9 @@ def create_app() -> Flask:
                 return jsonify(result), status
             if result is None:
                 return jsonify({"error": f"SKU not found for name: {sku_name}", "reason": "sku_name_not_found"}), 404
+            cache_invalidate("inventory:v1")
+            cache_invalidate("dashboard:v1")
+            cache_invalidate("products:v1")
             return jsonify(result), 201
         except Exception as e:
             return jsonify({"error": str(e)}), 400
@@ -1371,6 +1864,9 @@ def create_app() -> Flask:
                     return jsonify({"error": msg}), 400
             if result is None:
                 return jsonify({"error": "Batch not found"}), 404
+            cache_invalidate("inventory:v1")
+            cache_invalidate("dashboard:v1")
+            cache_invalidate("products:v1")
             return jsonify(result)
         except Exception as e:
             return jsonify({"error": str(e)}), 400
@@ -1406,6 +1902,9 @@ def create_app() -> Flask:
                     return jsonify({"error": msg}), 400
             if deleted_id is None:
                 return jsonify({"error": "Batch not found"}), 404
+            cache_invalidate("inventory:v1")
+            cache_invalidate("dashboard:v1")
+            cache_invalidate("products:v1")
             return jsonify({"deleted": True, "batch_id": deleted_id})
         except Exception as e:
             return jsonify({"error": str(e)}), 400
@@ -1445,12 +1944,14 @@ def create_app() -> Flask:
                     row = _work()
                 else:
                     return jsonify({"error": msg}), 400
-            return jsonify({
+            product_body = {
                 "product_id": int(row[0]),
                 "name": row[1],
                 "manufacturer": row[2],
                 "description": row[3],
-            }), 201
+            }
+            cache_invalidate("products:v1")
+            return jsonify(product_body), 201
         except Exception as e:
             return jsonify({"error": str(e), "reason": "unhandled_exception"}), 400
 
@@ -1509,13 +2010,15 @@ def create_app() -> Flask:
                     return jsonify({"error": msg}), 400
             if isinstance(row, dict) and row.get("error"):
                 return jsonify(row), 404
-            return jsonify({
+            sku_body = {
                 "sku_id": int(row[0]),
                 "product_id": int(row[1]),
                 "package_size": row[2],
                 "unit_type": row[3],
                 "base_price": float(row[4]),
-            }), 201
+            }
+            cache_invalidate("products:v1")
+            return jsonify(sku_body), 201
         except Exception as e:
             return jsonify({"error": str(e), "reason": "unhandled_exception"}), 400
 
@@ -1560,6 +2063,7 @@ def create_app() -> Flask:
                     return jsonify({"error": msg}), 400
             if result is None:
                 return jsonify({"error": "Order not found"}), 404
+            cache_invalidate("dashboard:v1")
             return jsonify(result)
         except Exception as e:
             return jsonify({"error": str(e)}), 400
@@ -1568,6 +2072,11 @@ def create_app() -> Flask:
     @requires_auth(role="admin")
     def admin_dashboard_stats():
         try:
+            cache_key = "dashboard:v1:stats"
+            cache_ttl = int(os.getenv("CACHE_TTL_DASHBOARD", "60"))
+            cached = cache_get(cache_key)
+            if cached is not None:
+                return jsonify(cached)
             def _work():
                 with get_connection() as conn:
                     with conn.cursor() as cur:
@@ -1680,7 +2189,10 @@ def create_app() -> Flask:
                     stats = _work()
                 else:
                     return jsonify({"error": msg}), 400
-            return jsonify(stats)
+            cache_set(cache_key, stats, cache_ttl)
+            r = jsonify(stats)
+            r.headers["Cache-Control"] = "private, max-age=60"
+            return r
         except Exception as e:
             return jsonify({"error": str(e)}), 400
 
@@ -1740,9 +2252,14 @@ def create_app() -> Flask:
                             sp = Decimal(str(sale_price))
                             cp = Decimal(str(cost_price))
                             bp = Decimal(str(base_price)) if base_price is not None else Decimal("0")
-                            disc_pct = float(0)
-                            if bp and bp > 0:
-                                disc_pct = float((Decimal(1) - (sp / bp)) * Decimal(100))
+                            # Compute discount only when sale below base; otherwise compute markup
+                            discount_pct = 0.0
+                            markup_pct = 0.0
+                            if bp > 0:
+                                if sp < bp:
+                                    discount_pct = float((bp - sp) / bp * Decimal(100))
+                                elif sp > bp:
+                                    markup_pct = float((sp - bp) / bp * Decimal(100))
                             line_total = sp * qty_i
                             line_profit = (sp - cp) * qty_i
                             total_qty += qty_i
@@ -1758,7 +2275,8 @@ def create_app() -> Flask:
                                 "base_price": float(bp),
                                 "sale_price": float(sp),
                                 "cost_price": float(cp),
-                                "discount_pct": round(disc_pct, 2),
+                                "discount_pct": round(discount_pct, 2),
+                                "markup_pct": round(markup_pct, 2),
                                 "line_total": float(line_total),
                                 "line_profit": float(line_profit),
                             })

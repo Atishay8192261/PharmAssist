@@ -13,7 +13,7 @@ import { PriceTag } from "@/components/shared/price-tag"
 import { QuantityInput } from "@/components/shared/quantity-input"
 import { TableRowsSkeleton } from "@/components/shared/skeletons"
 import { formatPrice } from "@/lib/utils"
-import { Trash2, ArrowRight, ShoppingBag } from "lucide-react"
+import { Trash2, ArrowRight, ShoppingBag, Home, List } from "lucide-react"
 import Link from "next/link"
 
 export default function CartPage() {
@@ -96,8 +96,18 @@ export default function CartPage() {
 
   if (loading) {
     return (
-      <div className="space-y-6">
-        <h1 className="text-3xl font-bold tracking-tight">Shopping Cart</h1>
+      <div className="space-y-6 max-w-5xl mx-auto px-4">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <h1 className="text-2xl md:text-3xl font-bold tracking-tight">Shopping Cart</h1>
+          <div className="flex items-center gap-2">
+            <Link href="/customer/catalog" className="inline-flex items-center gap-1 text-sm font-medium hover:text-primary">
+              <Home className="h-4 w-4" /> Home
+            </Link>
+            <Link href="/customer/my-orders" className="inline-flex items-center gap-1 text-sm font-medium hover:text-primary">
+              <List className="h-4 w-4" /> My Orders
+            </Link>
+          </div>
+        </div>
         <Card>
           <CardContent className="p-6">
             <Table>
@@ -138,8 +148,18 @@ export default function CartPage() {
   }
 
   return (
-    <div className="space-y-6">
-      <h1 className="text-3xl font-bold tracking-tight">Shopping Cart</h1>
+    <div className="space-y-6 max-w-5xl mx-auto px-4">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <h1 className="text-2xl md:text-3xl font-bold tracking-tight">Shopping Cart</h1>
+        <div className="flex items-center gap-2">
+          <Link href="/customer/catalog" className="inline-flex items-center gap-1 text-sm font-medium hover:text-primary">
+            <Home className="h-4 w-4" /> Home
+          </Link>
+          <Link href="/customer/my-orders" className="inline-flex items-center gap-1 text-sm font-medium hover:text-primary">
+            <List className="h-4 w-4" /> My Orders
+          </Link>
+        </div>
+      </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
         <div className="lg:col-span-2">

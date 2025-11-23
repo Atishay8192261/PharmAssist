@@ -1,7 +1,8 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import { apiClient, Product } from '@/lib/api';
+import { useState } from 'react';
+import { Product } from '@/lib/types';
+import { useProducts } from '@/hooks/useProducts';
 import { getCurrentUser } from '@/lib/auth';
 import { ProductCard } from './product-card';
 import { Input } from '@/components/ui/input';
@@ -10,8 +11,6 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Loader2 } from 'lucide-react';
 
 export function ProductCatalog() {
-  const [products, setProducts] = useState<Product[]>([]);
-  const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [quantity, setQuantity] = useState(1);
   const [orderSuccess, setOrderSuccess] = useState('');
@@ -19,29 +18,16 @@ export function ProductCatalog() {
   const user = getCurrentUser();
   const customerId = user?.customer_id;
 
-  useEffect(() => {
-    loadProducts();
-  }, [quantity, customerId]);
-
-  const loadProducts = async () => {
-    try {
-      setLoading(true);
-      setError('');
-      const response = await apiClient.getProducts({
-        customerId: customerId || undefined,
-        quantity,
-      });
-      setProducts(response.items);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load products');
-    } finally {
-      setLoading(false);
-    }
-  };
+  const { products, loading, error: swrError, refresh } = useProducts({
+    quantity,
+    customer_id: customerId,
+  });
+  // Merge SWR error into local error display
+  if (!error && swrError) setError(swrError.message || 'Failed to load products');
 
   const handleOrderSuccess = (message: string) => {
     setOrderSuccess(message);
-    loadProducts(); // Refresh products to update stock
+    refresh(); // Refresh products to update stock
     setTimeout(() => setOrderSuccess(''), 5000);
   };
 

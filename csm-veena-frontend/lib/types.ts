@@ -176,6 +176,7 @@ export interface AdminOrderItemDetail {
   sale_price: number
   cost_price: number
   discount_pct: number
+  markup_pct: number
   line_total: number
   line_profit: number
 }

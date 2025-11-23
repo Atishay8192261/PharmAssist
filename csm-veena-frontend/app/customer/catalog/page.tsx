@@ -129,10 +129,10 @@ export default function CatalogPage() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 max-w-7xl mx-auto px-4">
       <div className="flex flex-col gap-4">
-        <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4">
-          <h1 className="text-3xl font-bold tracking-tight">Product Catalog</h1>
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          <h1 className="text-2xl md:text-3xl font-bold tracking-tight">Product Catalog</h1>
           <form onSubmit={handleSearchSubmit} className="flex flex-col sm:flex-row gap-3 w-full xl:w-auto">
             <div className="flex flex-1 items-center gap-2 bg-muted p-2 rounded-lg">
               <span className="text-sm font-medium whitespace-nowrap">Pricing Preview Qty:</span>
@@ -169,15 +169,15 @@ export default function CatalogPage() {
         <div className="text-sm text-muted-foreground">No products match your search.</div>
       )}
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6 justify-items-stretch">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5 md:gap-6">
         {data?.items.map((product) => {
           const severity = getExpirySeverity(product.earliest_expiry)
 
           return (
-            <Card key={product.sku_id} className="flex flex-col h-full">
-              <CardHeader className="pb-2">
+            <Card key={product.sku_id} className="flex flex-col h-full transition-shadow hover:shadow-md">
+              <CardHeader className="pb-2 space-y-1">
                 <div className="flex justify-between items-start">
-                  <CardTitle className="text-lg font-semibold line-clamp-1" title={product.product_name}>
+                  <CardTitle className="text-base md:text-lg font-semibold line-clamp-1" title={product.product_name}>
                     {product.product_name}
                   </CardTitle>
                   {severity !== "normal" && (
@@ -189,7 +189,7 @@ export default function CatalogPage() {
                 <p className="text-sm text-muted-foreground">{product.manufacturer}</p>
               </CardHeader>
 
-              <CardContent className="flex-grow space-y-4">
+              <CardContent className="flex-grow space-y-4 text-sm">
                 <div className="space-y-1 text-sm">
                   <div className="flex justify-between">
                     <span className="text-muted-foreground">Package:</span>
@@ -254,29 +254,75 @@ export default function CatalogPage() {
       </div>
 
       {data && data.total_pages > 1 && (
-        <Pagination className="pt-4">
-          <PaginationContent>
-            <PaginationItem>
-              <PaginationPrevious
-                onClick={() => page > 1 && handlePageChange(page - 1)}
-                className={page <= 1 ? "pointer-events-none opacity-50" : "cursor-pointer"}
-              />
-            </PaginationItem>
-            {Array.from({ length: data.total_pages }, (_, i) => i + 1).map((p) => (
-              <PaginationItem key={p}>
-                <PaginationLink isActive={page === p} onClick={() => handlePageChange(p)} className="cursor-pointer">
-                  {p}
-                </PaginationLink>
+        <div className="pt-4 flex flex-col gap-3">
+          <Pagination>
+            <PaginationContent>
+              <PaginationItem>
+                <PaginationPrevious
+                  onClick={() => page > 1 && handlePageChange(page - 1)}
+                  className={page <= 1 ? "pointer-events-none opacity-50" : "cursor-pointer"}
+                />
               </PaginationItem>
-            ))}
-            <PaginationItem>
-              <PaginationNext
-                onClick={() => page < data.total_pages && handlePageChange(page + 1)}
-                className={page >= data.total_pages ? "pointer-events-none opacity-50" : "cursor-pointer"}
+              {(() => {
+                const total = data.total_pages
+                const windowSize = 10
+                let start = Math.max(1, page - Math.floor(windowSize / 2))
+                let end = start + windowSize - 1
+                if (end > total) {
+                  end = total
+                  start = Math.max(1, end - windowSize + 1)
+                }
+                const pages: number[] = []
+                for (let p = start; p <= end; p++) pages.push(p)
+                return pages.map((p) => (
+                  <PaginationItem key={p}>
+                    <PaginationLink isActive={page === p} onClick={() => handlePageChange(p)} className="cursor-pointer">
+                      {p}
+                    </PaginationLink>
+                  </PaginationItem>
+                ))
+              })()}
+              <PaginationItem>
+                <PaginationNext
+                  onClick={() => page < data.total_pages && handlePageChange(page + 1)}
+                  className={page >= data.total_pages ? "pointer-events-none opacity-50" : "cursor-pointer"}
+                />
+              </PaginationItem>
+            </PaginationContent>
+          </Pagination>
+          <div className="flex items-center gap-2 text-sm">
+            <span>Page</span>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault()
+                const form = e.currentTarget as HTMLFormElement
+                const input = form.querySelector<HTMLInputElement>('input[name="pageJump"]')
+                if (!input) return
+                const val = parseInt(input.value, 10)
+                if (!isNaN(val) && val >= 1 && val <= data.total_pages && val !== page) {
+                  handlePageChange(val)
+                }
+              }}
+              className="flex items-center gap-2"
+            >
+              <input
+                type="number"
+                name="pageJump"
+                min={1}
+                max={data.total_pages}
+                defaultValue={page}
+                className="w-16 rounded-md border px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-primary"
               />
-            </PaginationItem>
-          </PaginationContent>
-        </Pagination>
+              <button
+                type="submit"
+                className="text-sm px-3 py-1 rounded-md border bg-background hover:bg-muted transition-colors"
+              >
+                Go
+              </button>
+              <span className="text-muted-foreground">of {data.total_pages}</span>
+            </form>
+          </div>
+        </div>
       )}
     </div>
   )

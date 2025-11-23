@@ -188,7 +188,7 @@ export default function AdminOrdersPage() {
                         <TableHead className="text-right">Base</TableHead>
                         <TableHead className="text-right">Sale</TableHead>
                         <TableHead className="text-right">Cost</TableHead>
-                        <TableHead className="text-right">Discount %</TableHead>
+                        <TableHead className="text-right">Adj %</TableHead>
                         <TableHead className="text-right">Line Total</TableHead>
                         <TableHead className="text-right">Line Profit</TableHead>
                       </TableRow>
@@ -205,7 +205,26 @@ export default function AdminOrdersPage() {
                           <TableCell className="text-right">${formatPrice(it.base_price)}</TableCell>
                           <TableCell className="text-right">${formatPrice(it.sale_price)}</TableCell>
                           <TableCell className="text-right">${formatPrice(it.cost_price)}</TableCell>
-                          <TableCell className="text-right">{it.discount_pct.toFixed(2)}%</TableCell>
+                          <TableCell className="text-right">
+                            {(() => {
+                              const base = it.base_price
+                              const sale = it.sale_price
+                              const cost = it.cost_price
+                              if (base > 0 && sale < base) {
+                                // discount vs base
+                                return `-${(((base - sale) / base) * 100).toFixed(2)}%`
+                              }
+                              if (cost > 0 && sale >= base && sale > cost) {
+                                // margin vs cost
+                                return `+${(((sale - cost) / cost) * 100).toFixed(2)}%`
+                              }
+                              if (sale >= base && cost > 0 && sale <= cost) {
+                                // sale at or below cost after floor (edge)
+                                return '0%'
+                              }
+                              return '0%'
+                            })()}
+                          </TableCell>
                           <TableCell className="text-right">${formatPrice(it.line_total)}</TableCell>
                           <TableCell className="text-right">${formatPrice(it.line_profit)}</TableCell>
                         </TableRow>

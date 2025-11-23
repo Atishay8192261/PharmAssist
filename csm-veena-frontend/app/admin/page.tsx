@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react"
 import { api } from "@/lib/api"
+import { useInventory } from "@/hooks/useInventory"
 import type { AdminInventoryResponse, AdminOrder, AdminDashboardStats } from "@/lib/types"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip, Legend, CartesianGrid } from "recharts"
@@ -24,7 +25,7 @@ export default function AdminDashboardPage() {
       try {
         const [o, inv, st] = await Promise.all([
           api.getAllOrders(),
-          api.getAdminInventory(),
+          api.getAdminInventory({ filter: 'critical', limit: 100 }),
           api.getAdminDashboardStats(),
         ])
         if (!active) return
@@ -53,9 +54,8 @@ export default function AdminDashboardPage() {
   const latestOrders = orders.slice(0, 5)
 
   const lowStockBatches = useMemo(() => {
-    const threshold = 5
     const batches = inventory?.batches || []
-    return batches.filter(b => (b.quantity_on_hand ?? 0) <= threshold).slice(0, 5)
+    return batches.sort((a,b)=> (a.quantity_on_hand||0)-(b.quantity_on_hand||0)).slice(0,5)
   }, [inventory])
 
   const dailyPoints = stats?.daily ?? []
@@ -84,7 +84,7 @@ export default function AdminDashboardPage() {
         </Card>
         <Card>
           <CardHeader><CardTitle>Total Batches</CardTitle></CardHeader>
-          <CardContent className="text-3xl font-bold">{loading ? '…' : (inventory?.total_batches ?? 0)}</CardContent>
+          <CardContent className="text-3xl font-bold">{loading ? '…' : (stats?.total_batches ?? 0)}</CardContent>
         </Card>
         <Card>
           <CardHeader><CardTitle>Total Profit</CardTitle></CardHeader>
