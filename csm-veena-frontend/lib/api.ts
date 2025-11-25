@@ -239,6 +239,14 @@ class ApiClient {
       body: JSON.stringify(payload),
     })
   }
+
+  // OAuth (Google)
+  async exchangeGoogleOAuth(code: string, code_verifier: string): Promise<LoginResponse> {
+    return this.fetch<LoginResponse>("/api/oauth/google/exchange", {
+      method: "POST",
+      body: JSON.stringify({ code, code_verifier })
+    })
+  }
 }
 
 export const api = new ApiClient()

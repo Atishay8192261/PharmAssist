@@ -1,13 +1,19 @@
 import json
 import os
 import re
+import uuid
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
 import google.generativeai as genai
 from flask import Flask, jsonify, request, g
+import logging
 from flask_cors import CORS
 from .db import init_pool, get_connection, reset_pool
+try:
+    from .oauth import register_oauth
+except Exception:
+    register_oauth = None
 from psycopg import IsolationLevel
 from dotenv import load_dotenv
 import bcrypt
@@ -75,6 +81,121 @@ def create_app() -> Flask:
         except Exception:
             pass
 
+    # Structured logging (JSON) optional via STRUCTURED_LOGGING=1
+    if os.getenv("STRUCTURED_LOGGING") == "1":
+        class JsonFormatter(logging.Formatter):
+            def format(self, record):
+                base = {
+                    "ts": datetime.utcnow().isoformat() + "Z",
+                    "level": record.levelname,
+                    "msg": record.getMessage(),
+                    "logger": record.name,
+                }
+                if hasattr(record, 'request_id'):
+                    base['request_id'] = getattr(record, 'request_id')
+                if hasattr(record, 'path'):
+                    base['path'] = getattr(record, 'path')
+                return json.dumps(base, ensure_ascii=False)
+        handler = logging.StreamHandler()
+        handler.setFormatter(JsonFormatter())
+        root = logging.getLogger()
+        root.handlers = [handler]
+        root.setLevel(logging.INFO)
+
+    # Rate limiting (token bucket) configuration
+    RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED") == "1"
+    RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))  # per key
+    RATE_LIMIT_BURST = int(os.getenv("RATE_LIMIT_BURST", "30"))  # extra tokens allowed immediately
+    RATE_LIMIT_USE_REDIS = os.getenv("USE_REDIS_RATE_LIMIT") == "1"
+    _rate_limit_bucket_memory: dict[str, dict[str, float]] = {}
+    _rate_limit_lock = threading.Lock()
+    _rate_limit_redis = None
+    if RATE_LIMIT_ENABLED and RATE_LIMIT_USE_REDIS:
+        try:
+            import redis  # type: ignore
+            _rate_limit_redis = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+        except Exception:
+            _rate_limit_redis = None
+
+    def _rate_limit_key() -> str:
+        # Prefer authenticated user id; fallback IP address
+        uid = None
+        try:
+            claims = getattr(request, 'user', {}) or {}
+            uid = claims.get('sub') or claims.get('user_id')
+        except Exception:
+            uid = None
+        if uid is not None:
+            return f"user:{uid}"
+        ip = request.headers.get("X-Forwarded-For", request.remote_addr) or "unknown"
+        return f"ip:{ip}"
+
+    def _rate_limit_allow() -> bool:
+        if not RATE_LIMIT_ENABLED:
+            return True
+        # Exempt lightweight endpoints
+        if request.path in ("/health", "/ready", "/metrics"):
+            return True
+        key = _rate_limit_key()
+        now = time.time()
+        interval = 60.0
+        capacity = RATE_LIMIT_PER_MINUTE + RATE_LIMIT_BURST
+        if _rate_limit_redis is not None:
+            try:
+                # Use Redis hash per key: fields last_ts, tokens
+                pipe = _rate_limit_redis.pipeline()
+                pipe.hget(key, "last_ts")
+                pipe.hget(key, "tokens")
+                last_ts_raw, tokens_raw = pipe.execute()
+                last_ts = float(last_ts_raw) if last_ts_raw else now
+                tokens = float(tokens_raw) if tokens_raw else capacity
+                # Refill tokens
+                elapsed = max(0.0, now - last_ts)
+                refill = (RATE_LIMIT_PER_MINUTE * (elapsed / interval))
+                tokens = min(capacity, tokens + refill)
+                if tokens >= 1.0:
+                    tokens -= 1.0
+                    pipe.hset(key, mapping={"last_ts": now, "tokens": tokens})
+                    pipe.expire(key, 120)
+                    pipe.execute()
+                    return True
+                else:
+                    pipe.hset(key, mapping={"last_ts": now, "tokens": tokens})
+                    pipe.expire(key, 120)
+                    pipe.execute()
+                    return False
+            except Exception:
+                # Fallback to memory if Redis fails
+                pass
+        with _rate_limit_lock:
+            bucket = _rate_limit_bucket_memory.get(key)
+            if not bucket:
+                bucket = {"last_ts": now, "tokens": capacity}
+                _rate_limit_bucket_memory[key] = bucket
+            last_ts = bucket["last_ts"]
+            tokens = bucket["tokens"]
+            elapsed = max(0.0, now - last_ts)
+            refill = (RATE_LIMIT_PER_MINUTE * (elapsed / interval))
+            tokens = min(capacity, tokens + refill)
+            if tokens >= 1.0:
+                tokens -= 1.0
+                bucket["tokens"] = tokens
+                bucket["last_ts"] = now
+                return True
+            bucket["tokens"] = tokens
+            bucket["last_ts"] = now
+            return False
+
+    @app.before_request
+    def _rate_limit_hook():  # type: ignore
+        try:
+            allowed = _rate_limit_allow()
+            if not allowed:
+                return jsonify({"error": "Rate limit exceeded", "retry_in": 1}), 429
+        except Exception:
+            # Fail open
+            pass
+
     # Observability: optional timing middleware controlled by LOG_TIMING=1
     if os.getenv("LOG_TIMING") == "1":
         try:
@@ -91,6 +212,9 @@ def create_app() -> Flask:
             try:
                 g._req_start = time.perf_counter()
                 g.db_time_ms = 0.0
+                # Assign a request id (reuse incoming X-Request-ID or generate)
+                rid = request.headers.get('X-Request-ID') or str(uuid.uuid4())
+                g.request_id = rid
             except Exception:
                 pass
 
@@ -125,6 +249,9 @@ def create_app() -> Flask:
                             db_ms,
                             dur_ms,
                         )
+                    # Attach request id header
+                    if hasattr(g, 'request_id'):
+                        resp.headers['X-Request-ID'] = g.request_id
             except Exception:
                 pass
             return resp
@@ -135,6 +262,13 @@ def create_app() -> Flask:
     except Exception:
         # In dev without DB, health still works
         pass
+
+    # Register OAuth endpoints if module available
+    if register_oauth:
+        try:
+            register_oauth(app)
+        except Exception:
+            pass
 
     # Optional index bootstrap (controlled by RUN_INDEX_BOOTSTRAP=1)
     if os.getenv("RUN_INDEX_BOOTSTRAP") == "1":
@@ -432,6 +566,35 @@ def create_app() -> Flask:
         resp = jsonify({"status": "ok", "db": db_ok})
         resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         return resp
+
+    @app.get("/ready")
+    def ready():
+        # Readiness: DB reachable, critical envs set, optional Redis if enabled
+        checks = {
+            "db": False,
+            "secret_key": bool(os.getenv("SECRET_KEY")),
+            "database_url": bool(os.getenv("DATABASE_URL")),
+            "redis": None,
+        }
+        try:
+            with get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+            checks["db"] = True
+        except Exception as e:
+            checks["db_error"] = str(e)
+        if os.getenv("USE_REDIS_CACHE") == "1":
+            try:
+                import redis  # type: ignore
+                r = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+                r.ping()
+                checks["redis"] = True
+            except Exception as e:
+                checks["redis"] = False
+                checks["redis_error"] = str(e)
+        status_code = 200 if checks["db"] and checks["secret_key"] and checks["database_url"] and (checks["redis"] is not False) else 503
+        return jsonify(checks), status_code
 
     @app.get("/metrics")
     def metrics():

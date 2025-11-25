@@ -1,5 +1,8 @@
 -- PharmAssist Schema (PostgreSQL / Neon compatible)
 
+-- Ensure pgcrypto for password hashing functions (crypt, gen_salt)
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- 1. Customers (Pharmacies, Hospitals)
 CREATE TABLE IF NOT EXISTS Customers (
     customer_id SERIAL PRIMARY KEY,

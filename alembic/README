@@ -1,0 +1,10 @@
+Alembic migrations for PharmAssist.
+
+We use raw SQL from db/schema.sql for initial revision because the project does not define SQLAlchemy models.
+
+Commands:
+  export DATABASE_URL=postgresql://...
+  alembic upgrade head   # apply migrations
+  alembic revision -m "desc" --autogenerate  # only after adding SQLAlchemy models (future)
+
+Initial revision loads schema.sql idempotently.

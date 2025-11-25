@@ -32,3 +32,5 @@ Flask-Compress>=1.15
 
 # Optional Redis cache backend
 redis>=5.0.0
+alembic>=1.13.2
+SQLAlchemy>=2.0.0
