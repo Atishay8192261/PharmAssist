@@ -3,7 +3,6 @@
 import { useState } from 'react';
 import { Product } from '@/lib/types';
 import { useProducts } from '@/hooks/useProducts';
-import { getCurrentUser } from '@/lib/auth';
 import { ProductCard } from './product-card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -15,12 +14,8 @@ export function ProductCatalog() {
   const [quantity, setQuantity] = useState(1);
   const [orderSuccess, setOrderSuccess] = useState('');
 
-  const user = getCurrentUser();
-  const customerId = user?.customer_id;
-
   const { products, loading, error: swrError, refresh } = useProducts({
     quantity,
-    customer_id: customerId,
   });
   // Merge SWR error into local error display
   if (!error && swrError) setError(swrError.message || 'Failed to load products');

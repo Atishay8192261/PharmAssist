@@ -1,8 +1,8 @@
 'use client';
 
 import { useState } from 'react';
-import { Product, apiClient } from '@/lib/api';
-import { getCurrentUser } from '@/lib/auth';
+import type { Product } from '@/lib/types';
+import { api } from '@/lib/api';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -20,32 +20,18 @@ export function ProductCard({ product, onOrderSuccess }: ProductCardProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   
-  const user = getCurrentUser();
-  const customerId = user?.customer_id;
 
   const isOutOfStock = product.total_on_hand <= 0;
   const isLowStock = product.total_on_hand > 0 && product.total_on_hand <= 10;
 
   const handleOrder = async () => {
-    if (!customerId) {
-      setError('Customer ID not found');
-      return;
-    }
-
     setLoading(true);
     setError('');
 
     try {
-      // Note: The API expects batch_id, but the product catalog doesn't provide individual batches
-      // In a real implementation, you'd need to fetch batches or have a batch selection mechanism
-      // For now, we'll use sku_id as a placeholder - this may need adjustment based on your actual backend
-      await apiClient.placeOrder({
-        customer_id: customerId,
-        batch_id: product.sku_id, // This should be actual batch_id in production
-        quantity: orderQuantity,
-      });
-      
-      onOrderSuccess(`Successfully ordered ${orderQuantity} ${product.unit_type}(s) of ${product.product_name}`);
+      // Update cart with selected SKU and quantity; checkout flow is handled elsewhere
+      await api.updateCartItem(product.sku_id, orderQuantity);
+      onOrderSuccess(`Added ${orderQuantity} ${product.unit_type}(s) of ${product.product_name} to cart`);
       setOrderQuantity(1);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to place order');
@@ -94,7 +80,7 @@ export function ProductCard({ product, onOrderSuccess }: ProductCardProps) {
           </div>
           <div className="flex justify-between text-sm">
             <span className="text-muted-foreground">Expiry:</span>
-            <span>{new Date(product.earliest_expiry).toLocaleDateString()}</span>
+            <span>{product.earliest_expiry ? new Date(product.earliest_expiry).toLocaleDateString() : '—'}</span>
           </div>
         </div>
 
@@ -123,7 +109,7 @@ export function ProductCard({ product, onOrderSuccess }: ProductCardProps) {
           disabled={isOutOfStock || loading}
           className="w-full"
         >
-          {loading ? 'Placing Order...' : isOutOfStock ? 'Out of Stock' : 'Place Order'}
+          {loading ? 'Updating Cart...' : isOutOfStock ? 'Out of Stock' : 'Add to Cart'}
         </Button>
       </CardContent>
     </Card>

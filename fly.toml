@@ -1,0 +1,33 @@
+# Fly.io config for PharmAssist backend
+app = "pharmassist-backend" # set to your Fly app name
+primary_region = "iad"
+kill_signal = "SIGINT"
+kill_timeout = 5
+
+[build]
+  # Uses Dockerfile in repo root
+
+[env]
+  PORT = "5000"
+  FLASK_ENV = "production"
+
+[http_service]
+  internal_port = 5000
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 20
+    hard_limit = 40
+
+  [[http_service.checks]]
+    port = 5000
+    type = "http"
+    interval = "10s"
+    timeout = "2s"
+    path = "/ready"
+    grace_period = "10s"

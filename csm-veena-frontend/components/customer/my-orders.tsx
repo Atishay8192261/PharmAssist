@@ -1,7 +1,9 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { apiClient, Order } from '@/lib/api';
+// Use relative paths to avoid build alias resolution errors
+import { api } from '../../lib/api';
+import type { MyOrdersResponse } from '../../lib/types';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -14,6 +16,9 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
+
+// Define Order type locally by extracting it from the response
+type Order = MyOrdersResponse['orders'][number];
 
 export function MyOrders() {
   const [orders, setOrders] = useState<Order[]>([]);
@@ -28,7 +33,7 @@ export function MyOrders() {
     try {
       setLoading(true);
       setError('');
-      const response = await apiClient.getMyOrders();
+      const response = await api.getMyOrders();
       setOrders(response.orders);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load orders');

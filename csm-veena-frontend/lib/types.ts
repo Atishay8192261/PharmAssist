@@ -134,6 +134,9 @@ export interface AdminInventoryBatch {
 export interface AdminInventoryResponse {
   batches: AdminInventoryBatch[]
   total_batches: number
+  total_pages: number
+  current_page: number
+  page_size: number
 }
 
 export interface DashboardDayPoint {

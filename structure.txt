@@ -1,0 +1,169 @@
+.
+├── Dockerfile
+├── README.md
+├── alembic
+│   ├── README
+│   ├── __pycache__
+│   │   └── env.cpython-311.pyc
+│   ├── env.py
+│   └── versions
+│       ├── 20241124_0001_initial_schema.py
+│       └── __pycache__
+│           └── 20241124_0001_initial_schema.cpython-311.pyc
+├── alembic.ini
+├── backend
+│   ├── __init__.py
+│   ├── __pycache__
+│   │   ├── __init__.cpython-311.pyc
+│   │   ├── app.cpython-311.pyc
+│   │   ├── cache.cpython-311.pyc
+│   │   ├── db.cpython-311.pyc
+│   │   └── oauth.cpython-311.pyc
+│   ├── app.py
+│   ├── cache.py
+│   ├── config.py
+│   ├── db.py
+│   ├── oauth.py
+│   └── wsgi.py
+├── csm-veena-frontend
+│   ├── README.md
+│   ├── app
+│   │   ├── (customer)
+│   │   │   ├── cart
+│   │   │   │   └── page.tsx
+│   │   │   ├── catalog
+│   │   │   └── my-orders
+│   │   ├── admin
+│   │   │   ├── inventory
+│   │   │   │   ├── loading.tsx
+│   │   │   │   ├── page.tsx
+│   │   │   │   └── view
+│   │   │   │       └── page.tsx
+│   │   │   ├── layout.tsx
+│   │   │   ├── orders
+│   │   │   │   ├── loading.tsx
+│   │   │   │   └── page.tsx
+│   │   │   └── page.tsx
+│   │   ├── catalog
+│   │   │   └── page.tsx
+│   │   ├── customer
+│   │   │   ├── catalog
+│   │   │   │   └── page.tsx
+│   │   │   ├── layout.tsx
+│   │   │   ├── my-orders
+│   │   │   │   └── page.tsx
+│   │   │   └── page.tsx
+│   │   ├── favicon.ico
+│   │   ├── globals.css
+│   │   ├── layout.tsx
+│   │   ├── login
+│   │   │   ├── google
+│   │   │   │   └── callback
+│   │   │   │       └── page.tsx
+│   │   │   └── page.tsx
+│   │   ├── my-orders
+│   │   │   └── page.tsx
+│   │   └── page.tsx
+│   ├── components
+│   │   ├── admin
+│   │   │   ├── ai-inventory.tsx
+│   │   │   ├── all-orders.tsx
+│   │   │   ├── create-sku-modal.tsx
+│   │   │   └── manual-inventory-form.tsx
+│   │   ├── auth
+│   │   │   └── protected-route.tsx
+│   │   ├── customer
+│   │   │   ├── my-orders.tsx
+│   │   │   ├── product-card.tsx
+│   │   │   └── product-catalog.tsx
+│   │   ├── layouts
+│   │   │   ├── admin-layout.tsx
+│   │   │   └── customer-layout.tsx
+│   │   ├── shared
+│   │   │   ├── price-tag.tsx
+│   │   │   ├── quantity-input.tsx
+│   │   │   ├── skeletons.tsx
+│   │   │   └── status-badge.tsx
+│   │   └── ui
+│   │       ├── alert.tsx
+│   │       ├── badge.tsx
+│   │       ├── button.tsx
+│   │       ├── card.tsx
+│   │       ├── dropdown-menu.tsx
+│   │       ├── input.tsx
+│   │       ├── label.tsx
+│   │       ├── pagination.tsx
+│   │       ├── select.tsx
+│   │       ├── skeleton.tsx
+│   │       ├── sonner.tsx
+│   │       ├── table.tsx
+│   │       └── textarea.tsx
+│   ├── components.json
+│   ├── context
+│   │   ├── auth-context.tsx
+│   │   └── cart-context.tsx
+│   ├── eslint.config.mjs
+│   ├── hooks
+│   │   ├── use-debounce.ts
+│   │   ├── useDashboardStats.ts
+│   │   ├── useInventory.ts
+│   │   └── useProducts.ts
+│   ├── lib
+│   │   ├── api.ts
+│   │   ├── errors.ts
+│   │   ├── types.ts
+│   │   └── utils.ts
+│   ├── next-env.d.ts
+│   ├── next.config.ts
+│   ├── package-lock.json
+│   ├── package.json
+│   ├── postcss.config.mjs
+│   ├── public
+│   │   ├── file.svg
+│   │   ├── globe.svg
+│   │   ├── next.svg
+│   │   ├── vercel.svg
+│   │   └── window.svg
+│   └── tsconfig.json
+├── db
+│   ├── generate_scale_data.py
+│   ├── procedures.sql
+│   ├── schema.sql
+│   └── seed.sql
+├── docs
+│   ├── deployment-plan.md
+│   ├── performance-thresholds.md
+│   ├── scale-seeding.md
+│   └── testing-checklist.md
+├── init_db.py
+├── loadtest
+│   └── locustfile.py
+├── requirements-dev.txt
+├── requirements.txt
+├── scripts
+│   ├── __pycache__
+│   │   ├── test_inventory_crud.cpython-311-pytest-9.0.1.pyc
+│   │   └── test_pricing_discount.cpython-311-pytest-9.0.1.pyc
+│   ├── create_customer_users.py
+│   ├── explain_products.py
+│   ├── list_models.py
+│   ├── run_functional.py
+│   ├── run_smoke.py
+│   ├── set_passwords.py
+│   ├── test_inventory_crud.py
+│   ├── test_pricing_discount.py
+│   └── verify_seeding.py
+├── structure.txt
+└── tests
+    ├── __pycache__
+    │   ├── test_ai_endpoint.cpython-311-pytest-9.0.1.pyc
+    │   ├── test_concurrency.cpython-311-pytest-9.0.1.pyc
+    │   └── test_login.cpython-311-pytest-9.0.1.pyc
+    ├── test_ai_endpoint.py
+    ├── test_ai_nlp_validation.py
+    ├── test_concurrency.py
+    ├── test_jwt_tamper.py
+    ├── test_login.py
+    └── test_role_separation.py
+
+43 directories, 124 files

@@ -20,16 +20,13 @@ RUN useradd -m -u 1001 pharmassist
 COPY --from=builder /install /usr/local
 COPY backend backend
 COPY db db
-COPY alembic alembic
-COPY alembic.ini .
 COPY requirements.txt ./
-# Optional: copy scripts for scale / maintenance
+# Optional: copy scripts for maintenance
 COPY scripts scripts
 
 USER pharmassist
 EXPOSE 5000
 ENV STRUCTURED_LOGGING=1 LOG_TIMING=1 SLOW_REQUEST_MS=600 SLOW_DB_MS=450
 
-# Gunicorn entrypoint (adjust workers via env GUNICORN_WORKERS)
-ENV GUNICORN_WORKERS=4
-CMD ["bash", "-c", "gunicorn -w ${GUNICORN_WORKERS} -k gevent -t 90 backend.wsgi:app --bind 0.0.0.0:5000"]
+# Start Flask app per repo convention
+CMD ["python", "-m", "backend.app"]

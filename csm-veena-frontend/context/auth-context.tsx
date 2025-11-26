@@ -44,7 +44,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           logout()
         } else {
           setUser({
-            user_id: payload.sub,
+            user_id: typeof payload.sub === "string" ? Number(payload.sub) : payload.sub,
             username: payload.username,
             role: payload.role,
             customer_id: payload.customer_id,

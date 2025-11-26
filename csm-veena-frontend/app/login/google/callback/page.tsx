@@ -1,12 +1,12 @@
 "use client"
-import { useEffect, useState } from "react"
+import { useEffect, useState, Suspense } from "react"
 import { useRouter, useSearchParams } from "next/navigation"
 import { useAuth } from "@/context/auth-context"
 import { api } from "@/lib/api"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 
-export default function GoogleCallbackPage() {
+function GoogleCallbackInner() {
   const params = useSearchParams()
   const { login } = useAuth()
   const router = useRouter()
@@ -74,4 +74,12 @@ export default function GoogleCallbackPage() {
   }
 
   return <div className="flex min-h-screen items-center justify-center">Login successful. Redirecting...</div>
+}
+
+export default function GoogleCallbackPage() {
+  return (
+    <Suspense fallback={<div className="flex min-h-screen items-center justify-center">Loading...</div>}>
+      <GoogleCallbackInner />
+    </Suspense>
+  )
 }

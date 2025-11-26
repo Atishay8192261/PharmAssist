@@ -8,17 +8,19 @@ API_BASE = os.getenv("API_BASE", "http://localhost:5000")
 
 def main():
     load_dotenv()
-    # Login as admin to get a token for the protected admin endpoint
+
+    # Always log in as admin for this protected admin endpoint
     login = requests.post(
         f"{API_BASE}/api/login",
-        json={"username": "admin", "password": "test1234"},
+        json={"username": "admin", "password": "Admin!23"},
         timeout=15,
     )
     token = None
     try:
         token = login.json().get("access_token")
     except Exception:
-        pass
+        token = None
+
     headers = {"Authorization": f"Bearer {token}"} if token else {}
 
     payload = {

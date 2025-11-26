@@ -1,7 +1,11 @@
 'use client';
 
 import { useState, useEffect, useMemo } from 'react';
-import { apiClient, Order } from '@/lib/api';
+// Reverting to alias '@/' which your local build proved can be found.
+// We import 'api' because that is the actual export in your lib/api.ts
+import { api } from '@/lib/api';
+import type { AdminOrdersResponse } from '@/lib/types';
+
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -24,8 +28,13 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 
+// Define Order type by extracting it from the API response type
+// This avoids the "Module has no exported member 'Order'" error
+type Order = AdminOrdersResponse['orders'][number];
+
 export function AllOrders() {
-  const [orders, setOrders] = useState<Order[]>([]);
+  //const [orders, setOrders] = useState<Order[]>([]);
+  const [orders, setOrders] = useState<AdminOrdersResponse['orders']>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
@@ -39,7 +48,8 @@ export function AllOrders() {
     try {
       setLoading(true);
       setError('');
-      const response = await apiClient.getAllOrders();
+      // Use 'api' instance (singleton) instead of 'apiClient' class
+      const response = await api.getAllOrders();
       setOrders(response.orders);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load orders');
@@ -51,7 +61,8 @@ export function AllOrders() {
   const filteredOrders = useMemo(() => {
     return orders.filter((order) => {
       const matchesStatus = statusFilter === 'all' || order.status === statusFilter;
-      const matchesCustomer = !searchCustomerId || order.customer_id?.toString().includes(searchCustomerId);
+      // Safety check: ensure customer_id exists before stringifying
+      const matchesCustomer = !searchCustomerId || (order.customer_id && order.customer_id.toString().includes(searchCustomerId));
       return matchesStatus && matchesCustomer;
     });
   }, [orders, statusFilter, searchCustomerId]);

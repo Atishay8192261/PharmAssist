@@ -36,7 +36,7 @@ export default function AdminDashboardPage() {
         if (!active) return
         // Fallback empty state if API errors (e.g., no auth or network)
         setOrders([])
-        setInventory({ batches: [], total_batches: 0 })
+        setInventory({ batches: [], total_batches: 0, total_pages: 1, current_page: 1, page_size: 100 })
       } finally {
         if (active) setLoading(false)
       }

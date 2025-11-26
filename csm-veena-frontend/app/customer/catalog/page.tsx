@@ -136,13 +136,14 @@ export default function CatalogPage() {
           <form onSubmit={handleSearchSubmit} className="flex flex-col sm:flex-row gap-3 w-full xl:w-auto">
             <div className="flex flex-1 items-center gap-2 bg-muted p-2 rounded-lg">
               <span className="text-sm font-medium whitespace-nowrap">Pricing Preview Qty:</span>
+              <div className="w-24">
               <QuantityInput
                 value={quantityPreview}
                 onChange={handleQuantityPreviewChange}
                 min={1}
                 max={1000}
-                className="w-24"
               />
+            </div>
             </div>
             <div className="flex flex-1 items-center gap-2 bg-muted p-2 rounded-lg">
               <span className="text-sm font-medium whitespace-nowrap">Search:</span>
@@ -189,7 +190,7 @@ export default function CatalogPage() {
                 <p className="text-sm text-muted-foreground">{product.manufacturer}</p>
               </CardHeader>
 
-              <CardContent className="flex-grow space-y-4 text-sm">
+              <CardContent className="grow space-y-4 text-sm">
                 <div className="space-y-1 text-sm">
                   <div className="flex justify-between">
                     <span className="text-muted-foreground">Package:</span>

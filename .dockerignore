@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+venv/
+
+# Node/Frontend
+csm-veena-frontend/.next/
+csm-veena-frontend/node_modules/
+csm-veena-frontend/.env*
+
+# Logs
+*.log
+
+# VCS
+.git/
+.gitignore
+
+# Misc
+.DS_Store

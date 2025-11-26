@@ -26,7 +26,7 @@ def main():
         return r.status_code, data
 
     # Valid admin login
-    status, data = post_login("admin", "test1234")
+    status, data = post_login("admin", "Admin!23")
     if status == 200 and "access_token" in data:
         print("Admin login PASS")
     else:

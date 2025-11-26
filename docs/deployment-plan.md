@@ -49,6 +49,8 @@ Frontend:
 - Set `SECURE_COOKIES` if token ever moves to cookie storage.
 - Add CSP headers on admin interface.
 - Add MFA or secondary approval for admin critical actions.
+ - Tighten CORS: allow only `app.yourdomain.com`, `admin.yourdomain.com` origins.
+ - Rate limit `/api/login` and `/api/oauth/google/exchange` with token buckets.
 
 ## 9. Rollback Strategy
 - Maintain previous container image tag `prev-<sha>`.
@@ -71,6 +73,39 @@ Frontend:
 - Add blue/green deployment (two Fly apps or two ECS task sets) with traffic shifting.
 - Performance budget enforcement (e.g., automated Locust run gating deploy).
 - Tag releases automatically and generate changelog.
+
+## 14. Fly.io Quick Commands
+Authenticate and create app:
+```bash
+fly auth login
+fly apps create pharmassist-backend
+```
+
+Set secrets (replace with real values):
+```bash
+fly secrets set DATABASE_URL="postgres://..." SECRET_KEY="generate_a_long_random_string" \
+	GOOGLE_OAUTH_CLIENT_ID="..." GOOGLE_OAUTH_CLIENT_SECRET="..." GOOGLE_OAUTH_REDIRECT_URI="https://app.yourdomain.com/login/google/callback" \
+	ADMIN_EMAILS="admin@yourdomain.com" OAUTH_AUTO_CUSTOMER_TYPE="retail"
+```
+
+Build & deploy:
+```bash
+fly deploy --remote-only
+fly status
+fly logs
+```
+
+Rollback to previous image:
+```bash
+fly deploy --image prev-<sha>
+```
+
+## 15. Vercel Frontend Setup
+- Add project on Vercel and set env vars:
+	- `NEXT_PUBLIC_API_URL=https://<fly-app>.fly.dev` (or custom domain)
+	- `NEXT_PUBLIC_GOOGLE_OAUTH_CLIENT_ID=<your client id>`
+- Trigger build with `npm run build` locally first; ensure it passes.
+- Optional `vercel.json` can define headers for CSP on admin routes.
 
 ## 13. Quick Commands
 Backend container build locally:
