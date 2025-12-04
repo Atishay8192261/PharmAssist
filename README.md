@@ -1,82 +1,158 @@
 # PharmAssist
 
-A web-based CRM and inventory management system for a wholesale pharmaceutical distributor.
+A B2B pharmaceutical ordering and inventory management platform built to demonstrate solid relational design, transaction safety, pricing logic, and practical AI-assisted ingestion.
 
-## Stack
-- Database: Neon (Serverless PostgreSQL)
-- Backend: Python 3.10+ with Flask, psycopg 3
-- AI: LangChain + LLM API (OpenAI/Gemini)
-- Frontend: HTML/CSS/JS (thin client)
+## Overview
 
-## Quick start
+PharmAssist helps pharmacies and hospitals:
+- Browse a product catalog with customer- and quantity-aware pricing.
+- Maintain stock by batch with FEFO (First-Expire-First-Out) consumption on checkout.
+- Place orders safely under high concurrency.
+- Ingest inventory using AI prompts (admin), with validation and DB-backed updates.
+- View actionable admin analytics (revenue, profit, low stock, expiring soon).
 
-1. Create a Neon PostgreSQL database and copy the connection string.
-2. Copy `.env.example` to `.env` and set `DATABASE_URL`.
-3. Initialize schema:
-   - Using psql (optional): `psql "$DATABASE_URL" -f db/schema.sql`
-4. Install Python deps and run the API:
-   - Create a venv and `pip install -r requirements.txt`
-   - `python -m backend.app`
+This project intentionally pushes business integrity into SQL (stored procedures, triggers), with a thin Flask API and a Next.js frontend.
 
-## Environment variables
-- DATABASE_URL: Postgres connection string (Neon)
-- FLASK_ENV: development | production (optional)
-- SECRET_KEY: Flask secret (set in production)
-- OPENAI_API_KEY or GOOGLE_API_KEY: for the AI stretch feature (optional for now)
+## Tech Stack
 
-## Project structure
-- backend/: Flask app and DB code
-- db/: SQL schema, procedures, and seed data
-- frontend/: simple browser client (optional)
+- Backend: Flask (Python 3.11), psycopg 3, JWT auth, CORS
+- Database: Neon (PostgreSQL) with `SERIALIZABLE` isolation, stored procedures, triggers
+- Frontend: Next.js App Router (TypeScript), role-based layouts and contexts
+- AI: Google Gemini (Generative AI) for admin NLP inventory ingestion
+- Caching: In-memory (optional Redis hooks present)
+- Auth: Password + Google OAuth2 (PKCE)
 
-## Notes
-- Stored procedure `sp_PlaceOrder` will implement SERIALIZABLE + SELECT ... FOR UPDATE locking.
-- The API is intentionally thin and delegates concurrency to the database layer.
+## Architecture
 
-That's a great question. It's critical that the project doesn't just "work," but that it clearly *demonstrates* you've mastered the concepts from the course.
+- Backend: Single Flask app with inline routes in [backend/app.py](backend/app.py).
+  - DB access via pool in [backend/db.py](backend/db.py).
+  - Transient Neon disconnects auto-retry with `reset_pool()`.
+  - Admin-only endpoints protected by [`requires_auth(role="admin")`](backend/app.py).
+- Database:
+  - Schema, indexes, triggers: [db/schema.sql](db/schema.sql).
+  - Stored procedures: [db/procedures.sql](db/procedures.sql) including `sp_PlaceOrder`.
+  - Seed data: [db/seed.sql](db/seed.sql).
+- Frontend: Next.js App Router under [csm-veena-frontend/app/](csm-veena-frontend/app/).
+  - Role segmentation: `admin/`, `customer/`, public.
+  - State via [`AuthProvider`](csm-veena-frontend/context/auth-context.tsx) and [`CartProvider`](csm-veena-frontend/context/cart-context.tsx).
+  - Centralized API client: [`lib/api.ts`](csm-veena-frontend/lib/api.ts).
 
-Our plan is built to hit every single one of your professor's requirements. Here’s exactly how we're taking care of them and, more importantly, **how you will show them in your final presentation.**
+## Key Features
 
----
+- Products and Pricing
+  - Endpoint: [`GET /api/products`](backend/app.py) with discount rules by SKU/customer/quantity.
+  - Max discount computed via `Pricing_Rules`, rounded to 2 decimals.
+- Cart and Checkout
+  - FEFO consumption: earliest expiry batches locked and decremented in order.
+  - SERIALIZABLE isolation and `SELECT ... FOR UPDATE` batch locking.
+  - Customer-facing flows: cart, checkout, my orders.
+- Orders & Concurrency
+  - Stored procedure [`sp_PlaceOrder`](db/procedures.sql) called from [`/api/orders`](backend/app.py).
+  - Prevents overselling under simultaneous requests.
+- Admin
+  - Inventory listing, batch CRUD, dashboard stats: revenue/profit/daily/weekly, low stock, expiring soon.
+  - AI NLP ingestion: [`POST /api/admin/add-inventory-nlp`](backend/app.py) parses free text and upserts a batch.
+- OAuth2 (Google)
+  - PKCE flow via frontend; exchange + verification on backend.
 
-### 1. The Requirement: E-R Model & Relational Design
+## Database Design Highlights
 
-* **How We're Showing It:** This is your **`db/schema.sql`** file.
-* **In Your Demo, You'll Say:** "Here is our logical E-R model, which we implemented in `schema.sql`. We separated `Products` from `Product_SKUs` and `Inventory_Batches` to achieve 3rd Normal Form and prevent data redundancy. For example, a single product like 'Paracetamol' can have multiple `SKUs` (500mg, 100mg), and each `SKU` can have multiple `Batches` with different expiry dates. This design is robust and scalable."
+- Normalized tables: Products → Product_SKUs → Inventory_Batches
+- Inventory summary table maintained via triggers for fast catalog rendering.
+- Pricing rules precedence: SKU+customer, SKU-only, customer-only, global wildcard.
 
----
+## Running Locally
 
-### 2. The Requirement: Transactions & Concurrency Control
+### Prerequisites
+- Python 3.11+
+- Node.js 18+
+- Neon PostgreSQL URL with `sslmode=require`
 
-* **How We're Showing It:** This is the **star of the project**: your **`db/procedures.sql`** file, which contains the `sp_PlaceOrder` stored procedure.
-* **In Your Demo, You'll Say:** "The most complex part of a retail system is handling concurrency—what happens when two users try to buy the last item at the same time? We solved this at the database level using a stored procedure that runs in a `SERIALIZABLE` **transaction**.
-* **Then you'll show the code and explain:**
-    * **`TRANSACTION`**: "This ensures that all steps—checking stock, reducing quantity, and creating the order—happen as one atomic unit. If any part fails, the whole order is rolled back."
-    * **`SELECT ... FOR UPDATE`**: "This is the key. When a user tries to buy, this command places a *pessimistic lock* on that specific inventory row. The second user *must wait* until the first user's transaction is finished. This makes it impossible to oversell."
+### Environment Variables
 
----
+Backend (.env):
+- DATABASE_URL
+- SECRET_KEY
+- GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, GOOGLE_OAUTH_REDIRECT_URI
+- GOOGLE_API_KEY (for admin AI inventory endpoint)
+- Optional: ADMIN_EMAILS or ADMIN_EMAIL_DOMAIN, OAUTH_AUTO_CUSTOMER_TYPE
+- Optional tuning: DB_POOL_MAX, PRODUCTS_PREWARM, DASHBOARD_PREWARM
 
-### 3. The Requirement: Stored Procedures & Triggers
+Frontend (`csm-veena-frontend/.env.local`):
+- NEXT_PUBLIC_API_URL
+- NEXT_PUBLIC_GOOGLE_OAUTH_CLIENT_ID
 
-* **How We're Showing It:** The **`sp_PlaceOrder`** procedure is your primary example.
-* **In Your Demo, You'll Say:** "We encapsulated all our critical business logic inside this stored procedure. The Flask API just makes one call: `CALL sp_PlaceOrder(...)`. This is more secure and efficient, as the logic lives right next to the data, and it reduces the number of round-trips between the application and the database."
+### Initialize DB
 
----
+- Apply schema:
+  - psql: `psql "$DATABASE_URL" -f db/schema.sql`
+  - Or: `python init_db.py`
+- (Optional) Procedures:
+  - `psql "$DATABASE_URL" -f db/procedures.sql`
+- Seed demo data:
+  - `psql "$DATABASE_URL" -f db/seed.sql`
 
-### 4. The Requirement: Query Optimization & Indexes
+### Start Backend
 
-* **How We're Showing It:** The `GET /api/products` endpoint and the `CREATE INDEX` commands in your `schema.sql`.
-* **In Your Demo, You'll Say:** "Our product catalog query is complex, joining 5 tables to show customer-specific pricing and real-time stock.
-    1.  **First, we'll run the query with `EXPLAIN ANALYZE` *without* indexes.** You'll show the high "cost" and slow speed.
-    2.  **Then, you'll show the `CREATE INDEX` commands** in your `schema.sql`.
-    3.  **Finally, you'll run the *same query* again.** You'll show the new, much lower "cost" and faster speed, proving our indexing strategy worked. This is a perfect, visual demo of optimization."
+```sh
+# In repo root
+pip install -r requirements.txt
+python -m backend.app
+# Backend listens on http://localhost:5000
+```
 
----
+Endpoints to try:
+- Login: `POST /api/login`
+- Products: `GET /api/products?page=1&limit=20&quantity=5`
+- Cart: `GET /api/cart`
+- Checkout: `POST /api/checkout`
+- Admin: `GET /api/admin/inventory`, `GET /api/admin/dashboard-stats`
 
-### 5. The Requirement: Scale Test Plan
+### Start Frontend
 
-* **How We're Showing It:** This is the *proof* that your concurrency control works.
-* **In Your Demo, You'll Say:** "To prove our transaction logic works under pressure, we used a load-testing tool, `JMeter`, for our scale test. We simulated 100 users all trying to order the last 10 units of a single batch at the exact same time.
-* **Then, you'll show the results:** "As you can see, only 10 orders succeeded, and the database stock is now 0. Our system did not fail, did not crash, and did not oversell. This proves our concurrency model is correct."
+```sh
+cd csm-veena-frontend
+npm install
+npm run dev
+# Frontend at http://localhost:3000
+```
 
-Our entire project is designed around these five key demos. You won't just *tell* your professor you did them; you'll **show** and **prove** them one by one.
+Roles:
+- Admin: seeded user `admin` / `Admin!23` (see [db/seed.sql](db/seed.sql))
+- Customer: `pharma1` / `test1234` (mapped to a real `customer_id`)
+
+## Testing & Load
+
+- Smoke runner: [scripts/run_smoke.py](scripts/run_smoke.py)
+- Functional sample: [scripts/run_functional.py](scripts/run_functional.py)
+- Concurrency test: [tests/test_concurrency.py](tests/test_concurrency.py)
+  - env: `CONCURRENCY_THREADS`, `CONCURRENCY_ORDER_QTY`, `CONCURRENCY_TARGET_STOCK`
+- AI admin test: [tests/test_ai_endpoint.py](tests/test_ai_endpoint.py)
+- Role separation: [tests/test_role_separation.py](tests/test_role_separation.py)
+- Load test: [loadtest/locustfile.py](loadtest/locustfile.py)
+
+Performance tuning tips in [docs/performance-thresholds.md](docs/performance-thresholds.md).
+
+## Implementation Notes
+
+- Transient reconnects: endpoints wrap DB work in `_work()` and retry once when matching Neon error substrings.
+- Numeric normalization: all API responses cast numeric fields to real numbers for React rendering (see [`lib/api.ts`](csm-veena-frontend/lib/api.ts)).
+- FEFO enforcement: checkout locks batches via `FOR UPDATE` and deducts sequentially.
+- Caching: in-memory product/inventory/dashboard cache with invalidation after mutations.
+
+## Folder Guide
+
+- Backend: [backend/app.py](backend/app.py), [backend/db.py](backend/db.py), [backend/oauth.py](backend/oauth.py)
+- Frontend: [csm-veena-frontend/app/](csm-veena-frontend/app/), [csm-veena-frontend/components/](csm-veena-frontend/components/), [csm-veena-frontend/lib/api.ts](csm-veena-frontend/lib/api.ts)
+- Database: [db/schema.sql](db/schema.sql), [db/procedures.sql](db/procedures.sql), [db/seed.sql](db/seed.sql)
+- Docs: [docs/deployment-plan.md](docs/deployment-plan.md), [docs/testing-checklist.md](docs/testing-checklist.md), [docs/scale-seeding.md](docs/scale-seeding.md)
+
+## Roadmap
+
+- Rate limiting for `/api/login` and OAuth exchange
+- Redis cache for multi-instance deployments
+- More pytest coverage for pricing, FEFO, OAuth edge cases
+
+## Contact
+
+Open to suggestions or collaboration. Feel free to email me at: atishayjain8192261@gmail.com
